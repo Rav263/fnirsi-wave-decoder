@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
 """
-FNIRSI 1014D Oscilloscope WAV Trace Decoder
+FNIRSI Oscilloscope WAV Trace Decoder
 
-Decodes proprietary .wav files saved by FNIRSI 1014D oscilloscope
+Decodes proprietary .wav files saved by FNIRSI oscilloscopes
 and exports them as .csv (data) and .png (plot).
 
-File format (15000 bytes total):
-  - Header:    bytes 0-999    (500 uint16 LE values)
-  - CH1 data:  bytes 1000-3999 (1500 uint16 LE samples)
-  - CH2 data:  bytes 4000-6999 (1500 uint16 LE samples, zeros if single channel)
-  - Extra:     bytes 7000+     (additional data, ignored)
+Supported models:
+  - FNIRSI 1014D  (15000-byte files, uint16 LE)
+  - FNIRSI DPOX180H (variable-size files, uint16 BE)
 
-Header fields (uint16 LE at byte offset):
-  0x0C  (idx  6):  CH2 enabled flag (0=off, 1=on)
-  0x16  (idx 11):  Timebase index
-  0x52  (idx 41):  CH1 GND offset (ADC value for 0V)
-  0x54  (idx 42):  CH2 GND offset
-  0xD2  (idx 105): CH1 Vpp in mV
-  0x102 (idx 129): CH2 Vpp in mV
+--- FNIRSI 1014D format (15000 bytes total) ---
+  Header:    bytes 0-999    (500 uint16 LE values)
+  CH1 data:  bytes 1000-3999 (1500 uint16 LE samples)
+  CH2 data:  bytes 4000-6999 (1500 uint16 LE samples, zeros if single channel)
+  Extra:     bytes 7000+     (additional data, ignored)
+
+--- FNIRSI DPOX180H format (variable size) ---
+  Header fields (uint32 BE):
+    bytes[16:20]  settings header size
+    bytes[20:24]  data section size (display buffer + ADC, split 50/50)
+    bytes[24:28]  total file size
+  Sample rate (uint32 BE) at byte offset 0x72.
+  ADC data: unsigned uint16 Big-Endian, CH1 then CH2.
+  ADC block starts at: settings_size + data_section_size / 2
+  Samples per channel = data_section_size / 8
 """
 
 import struct
@@ -172,11 +178,193 @@ def parse_trace(filepath):
         'ch1_gnd': ch1_gnd,
         'ch2_gnd': ch2_gnd,
         'sample_interval_ns': sample_interval_ns,
+        'model': '1014D',
     }
+
+
+# --- DPOX180H display constants ---
+DPOX_N_VDIV = 8          # vertical divisions on screen
+DPOX_ADC_MAX = 12800     # full ADC range (0..12800)
+DPOX_ADC_CENTER = 6400   # center of screen in ADC counts
+DPOX_COUNTS_PER_DIV = DPOX_ADC_MAX // DPOX_N_VDIV  # 1600
+
+# Standard V/div table (mV), indexed 0-9
+DPOX_VDIV_TABLE = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000]
+
+# Header offsets for per-channel V/div index (uint16 BE)
+# Two config blocks: Block1 (CH1) at 0x60, Block2 (CH2) at 0xA0
+# V/div index at relative offset +0x0A within each block
+DPOX_CH1_VDIV_IDX_OFFSET = 0x6A  # Block1 + 0x0A
+DPOX_CH2_VDIV_IDX_OFFSET = 0xAA  # Block2 + 0x0A
+
+
+def _dpox_read_vdiv(data, offset):
+    """Read V/div index from header and return value in mV."""
+    idx = struct.unpack('>H', data[offset:offset + 2])[0]
+    if 0 <= idx < len(DPOX_VDIV_TABLE):
+        return DPOX_VDIV_TABLE[idx]
+    return None
+
+
+def parse_trace_dpox180h(filepath, ch1_vdiv_mV=None, ch2_vdiv_mV=None):
+    """
+    Parse an FNIRSI DPOX180H .wav trace file.
+
+    File layout:
+      [0 .. settings_size)                    — settings header
+      [settings_size .. settings_size + D/2)   — display buffer
+      [settings_size + D/2 .. file_end)        — ADC data (CH1 then CH2)
+    where D = data_section_size (from header).
+
+    ch1_vdiv_mV / ch2_vdiv_mV: V/div in millivolts for each channel.
+      If provided, overrides the value read from the header.
+      Otherwise, V/div is auto-detected from the header (index at
+      0x6A for CH1, 0xAA for CH2 → standard 1-2-5 table).
+      Calibrated formula: voltage_mV = (adc - 6400) * vdiv_mV / 1600
+
+    Returns a dict compatible with save_csv / save_png / save_tek_*.
+    """
+    with open(filepath, 'rb') as f:
+        data = f.read()
+
+    if len(data) < 256:
+        raise ValueError(
+            f"File too small for DPOX180H format: {len(data)} bytes"
+        )
+
+    # --- Parse structural header (uint32 BE at fixed offsets) ---
+    settings_size = struct.unpack('>I', data[16:20])[0]
+    data_section_size = struct.unpack('>I', data[20:24])[0]
+    file_size_expected = struct.unpack('>I', data[24:28])[0]
+
+    if len(data) != file_size_expected:
+        raise ValueError(
+            f"DPOX180H: file size mismatch: header says {file_size_expected}, "
+            f"actual {len(data)}"
+        )
+    if settings_size + data_section_size != file_size_expected:
+        raise ValueError(
+            f"DPOX180H: structural inconsistency: "
+            f"settings({settings_size}) + data({data_section_size}) "
+            f"!= file_size({file_size_expected})"
+        )
+    if data_section_size % 4 != 0:
+        raise ValueError(
+            f"DPOX180H: data section size {data_section_size} not divisible by 4"
+        )
+
+    # --- Sample rate (uint32 BE at offset 0x72) ---
+    sample_rate = struct.unpack('>I', data[0x72:0x76])[0]
+    if sample_rate == 0:
+        print("  Warning: sample rate is 0, defaulting to 5 MHz",
+              file=sys.stderr)
+        sample_rate = 5_000_000
+
+    # --- ADC data layout ---
+    adc_block_size = data_section_size // 2
+    adc_start = settings_size + adc_block_size
+    ch_data_bytes = adc_block_size // 2  # bytes per channel
+    samples_per_channel = ch_data_bytes // 2  # uint16 = 2 bytes
+
+    # --- Extract CH1 and CH2 raw samples (uint16 BE) ---
+    ch1_bytes = data[adc_start:adc_start + ch_data_bytes]
+    ch2_bytes = data[adc_start + ch_data_bytes:adc_start + adc_block_size]
+
+    ch1_raw = list(struct.unpack('>' + 'H' * samples_per_channel, ch1_bytes))
+    ch2_raw = list(struct.unpack('>' + 'H' * samples_per_channel, ch2_bytes))
+
+    # Detect if CH2 is actually used (not all zeros)
+    ch2_enabled = any(v != 0 for v in ch2_raw)
+    if not ch2_enabled:
+        ch2_raw = None
+
+    # --- Time axis ---
+    sample_interval_ns = 1e9 / sample_rate
+    time_ns = [i * sample_interval_ns for i in range(samples_per_channel)]
+
+    # Estimate ns_per_div: total_time / 6 divisions (DPOX180H display)
+    total_time_ns = time_ns[-1] if len(time_ns) > 1 else sample_interval_ns
+    ns_per_div = total_time_ns / 6.0
+
+    # --- V/div: CLI override → header auto-detect → uncalibrated fallback ---
+    vdiv_source = 'cli' if (ch1_vdiv_mV is not None or ch2_vdiv_mV is not None) else None
+    if ch1_vdiv_mV is None:
+        ch1_vdiv_mV = _dpox_read_vdiv(data, DPOX_CH1_VDIV_IDX_OFFSET)
+        if ch1_vdiv_mV is not None and vdiv_source is None:
+            vdiv_source = 'header'
+    if ch2_vdiv_mV is None:
+        ch2_vdiv_mV = _dpox_read_vdiv(data, DPOX_CH2_VDIV_IDX_OFFSET)
+
+    calibrated = ch1_vdiv_mV is not None
+    ch1_gnd = DPOX_ADC_CENTER
+    ch2_gnd = DPOX_ADC_CENTER
+
+    if calibrated:
+        # Proper calibration: voltage = (adc - center) * vdiv / counts_per_div
+        ch1_mV_per_count = ch1_vdiv_mV / DPOX_COUNTS_PER_DIV
+        ch1_mV = [round((v - DPOX_ADC_CENTER) * ch1_mV_per_count, 2)
+                  for v in ch1_raw]
+        if ch2_raw:
+            c2_vdiv = ch2_vdiv_mV if ch2_vdiv_mV is not None else ch1_vdiv_mV
+            ch2_mV_per_count = c2_vdiv / DPOX_COUNTS_PER_DIV
+            ch2_mV = [round((v - DPOX_ADC_CENTER) * ch2_mV_per_count, 2)
+                      for v in ch2_raw]
+        else:
+            ch2_mV = None
+    else:
+        # Uncalibrated fallback: 10 mV/count from median-based GND
+        def estimate_gnd(raw_samples):
+            s = sorted(raw_samples)
+            n = len(s)
+            return (s[n // 2] + s[(n - 1) // 2]) / 2
+        ch1_gnd = int(estimate_gnd(ch1_raw))
+        ch2_gnd = int(estimate_gnd(ch2_raw)) if ch2_raw else 0
+        mV_per_count = 10.0
+        ch1_mV = [round((v - ch1_gnd) * mV_per_count, 2) for v in ch1_raw]
+        ch2_mV = ([round((v - ch2_gnd) * mV_per_count, 2) for v in ch2_raw]
+                  if ch2_raw else None)
+
+    # Vpp from data
+    ch1_vpp_mV = round(max(ch1_mV) - min(ch1_mV), 2) if ch1_mV else 0
+    ch2_vpp_mV = round(max(ch2_mV) - min(ch2_mV), 2) if ch2_mV else 0
+
+    return {
+        'ch1_raw': ch1_raw,
+        'ch2_raw': ch2_raw,
+        'ch1_mV': ch1_mV,
+        'ch2_mV': ch2_mV,
+        'time_ns': time_ns,
+        'ch2_enabled': ch2_enabled,
+        'timebase_idx': -1,
+        'ns_per_div': ns_per_div,
+        'ch1_vpp_mV': ch1_vpp_mV,
+        'ch2_vpp_mV': ch2_vpp_mV,
+        'ch1_gnd': ch1_gnd,
+        'ch2_gnd': ch2_gnd,
+        'sample_interval_ns': sample_interval_ns,
+        'sample_rate': sample_rate,
+        'samples_per_channel': samples_per_channel,
+        'settings_size': settings_size,
+        'data_section_size': data_section_size,
+        'model': 'DPOX180H',
+        'calibrated': calibrated,
+        'vdiv_source': vdiv_source if calibrated else None,
+        'ch1_vdiv_mV': ch1_vdiv_mV,
+        'ch2_vdiv_mV': ch2_vdiv_mV if ch2_vdiv_mV is not None else ch1_vdiv_mV,
+    }
+
+
+def _format_vdiv(mV):
+    """Format V/div value in mV to human-readable string."""
+    if mV >= 1000:
+        return f"{mV/1000:.6g}V"
+    else:
+        return f"{mV:.6g}mV"
 
 
 def save_csv(trace, output_path):
     """Export trace data to CSV."""
+    n_samples = len(trace['ch1_raw'])
     with open(output_path, 'w', newline='') as f:
         writer = csv.writer(f)
 
@@ -184,7 +372,7 @@ def save_csv(trace, output_path):
             writer.writerow([
                 'time_ns', 'ch1_mV', 'ch2_mV', 'ch1_raw', 'ch2_raw'
             ])
-            for i in range(SAMPLES_PER_CHANNEL):
+            for i in range(n_samples):
                 writer.writerow([
                     f"{trace['time_ns'][i]:.2f}",
                     f"{trace['ch1_mV'][i]:.2f}",
@@ -194,7 +382,7 @@ def save_csv(trace, output_path):
                 ])
         else:
             writer.writerow(['time_ns', 'ch1_mV', 'ch1_raw'])
-            for i in range(SAMPLES_PER_CHANNEL):
+            for i in range(n_samples):
                 writer.writerow([
                     f"{trace['time_ns'][i]:.2f}",
                     f"{trace['ch1_mV'][i]:.2f}",
@@ -226,18 +414,35 @@ def save_png(trace, output_path, title=''):
     tb_label = format_time_per_div(trace['ns_per_div'])
 
     # Plot channels
-    ch1_label = f"CH1 (Vpp={trace['ch1_vpp_mV']}mV)"
+    is_dpox = trace.get('model') == 'DPOX180H'
+    dpox_cal = trace.get('calibrated', False)
+    if is_dpox and not dpox_cal:
+        ch1_label = 'CH1'
+        y_label = 'mV (uncalibrated, 10 mV/count)'
+    elif is_dpox and dpox_cal:
+        ch1_vd = trace.get('ch1_vdiv_mV', 0)
+        ch1_label = f"CH1 ({_format_vdiv(ch1_vd)}/div)"
+        y_label = 'Voltage (mV)'
+    else:
+        ch1_label = f"CH1 (Vpp={trace['ch1_vpp_mV']}mV)"
+        y_label = 'Voltage (mV)'
     ax.plot(time_plot, trace['ch1_mV'],
             label=ch1_label, color='#FFD700', linewidth=0.8)
 
     if trace['ch2_enabled']:
-        ch2_label = f"CH2 (Vpp={trace['ch2_vpp_mV']}mV)"
+        if is_dpox and dpox_cal:
+            ch2_vd = trace.get('ch2_vdiv_mV', 0)
+            ch2_label = f"CH2 ({_format_vdiv(ch2_vd)}/div)"
+        elif is_dpox:
+            ch2_label = 'CH2'
+        else:
+            ch2_label = f"CH2 (Vpp={trace['ch2_vpp_mV']}mV)"
         ax.plot(time_plot, trace['ch2_mV'],
                 label=ch2_label, color='#00FFFF', linewidth=0.8)
 
     # Styling (dark oscilloscope theme)
     ax.set_xlabel(f'Time ({unit})', color='white')
-    ax.set_ylabel('Voltage (mV)', color='white')
+    ax.set_ylabel(y_label, color='white')
     ax.set_title(
         (title or os.path.basename(output_path)) + f'  [{tb_label}]',
         color='white', fontsize=13
@@ -268,17 +473,34 @@ def save_plot(trace, output_path, title='', fmt='png'):
     time_plot = [t / factor for t in trace['time_ns']]
     tb_label = format_time_per_div(trace['ns_per_div'])
 
-    ch1_label = f"CH1 (Vpp={trace['ch1_vpp_mV']}mV)"
+    is_dpox = trace.get('model') == 'DPOX180H'
+    dpox_cal = trace.get('calibrated', False)
+    if is_dpox and not dpox_cal:
+        ch1_label = 'CH1'
+        y_label = 'mV (uncalibrated, 10 mV/count)'
+    elif is_dpox and dpox_cal:
+        ch1_vd = trace.get('ch1_vdiv_mV', 0)
+        ch1_label = f"CH1 ({_format_vdiv(ch1_vd)}/div)"
+        y_label = 'Voltage (mV)'
+    else:
+        ch1_label = f"CH1 (Vpp={trace['ch1_vpp_mV']}mV)"
+        y_label = 'Voltage (mV)'
     ax.plot(time_plot, trace['ch1_mV'],
             label=ch1_label, color='#FFD700', linewidth=0.8)
 
     if trace['ch2_enabled']:
-        ch2_label = f"CH2 (Vpp={trace['ch2_vpp_mV']}mV)"
+        if is_dpox and dpox_cal:
+            ch2_vd = trace.get('ch2_vdiv_mV', 0)
+            ch2_label = f"CH2 ({_format_vdiv(ch2_vd)}/div)"
+        elif is_dpox:
+            ch2_label = 'CH2'
+        else:
+            ch2_label = f"CH2 (Vpp={trace['ch2_vpp_mV']}mV)"
         ax.plot(time_plot, trace['ch2_mV'],
                 label=ch2_label, color='#00FFFF', linewidth=0.8)
 
     ax.set_xlabel(f'Time ({unit})', color='white')
-    ax.set_ylabel('Voltage (mV)', color='white')
+    ax.set_ylabel(y_label, color='white')
     ax.set_title(
         (title or os.path.basename(output_path)) + f'  [{tb_label}]',
         color='white', fontsize=13
@@ -362,7 +584,7 @@ def save_tek_csv(trace, output_path, channel='CH1'):
         ('Pt Fmt,Y',),
         ('Yzero,0.000000e+00',),
         ('Probe Atten,1.000000e+00',),
-        ('Model Number,FNIRSI 1014D',),
+        (f'Model Number,FNIRSI {trace.get("model", "1014D")}',),
         ('Serial Number,',),
         ('Firmware Version,',),
     ]
@@ -417,13 +639,29 @@ def save_tek_bundle(trace, out_dir, name, title=''):
 def print_info(filepath, trace):
     """Print summary info about the trace."""
     name = os.path.basename(filepath)
+    model = trace.get('model', '1014D')
     tb = format_time_per_div(trace['ns_per_div'])
     si = format_time(trace['sample_interval_ns'])
+    n_samples = len(trace['ch1_raw'])
     total = format_time(trace['time_ns'][-1])
 
     print(f"  File:       {name}")
-    print(f"  Timebase:   {tb}  (index {trace['timebase_idx']})")
-    print(f"  Sample int: {si}  ({SAMPLES_PER_CHANNEL} samples, total {total})")
+    print(f"  Model:      FNIRSI {model}")
+    if model == 'DPOX180H':
+        sr = trace.get('sample_rate', 0)
+        sr_str = f"{sr/1e6:.3g} MHz" if sr >= 1e6 else f"{sr/1e3:.3g} kHz"
+        print(f"  SampleRate: {sr_str}")
+        print(f"  Timebase:   {tb}  (estimated)")
+        if trace.get('calibrated'):
+            ch1_vd = trace.get('ch1_vdiv_mV', 0)
+            ch2_vd = trace.get('ch2_vdiv_mV', 0)
+            src = trace.get('vdiv_source', 'unknown')
+            print(f"  V/div:      CH1={_format_vdiv(ch1_vd)}, CH2={_format_vdiv(ch2_vd)}  (from {src})")
+        else:
+            print(f"  V/div:      not detected (use --vdiv to calibrate)")
+    else:
+        print(f"  Timebase:   {tb}  (index {trace['timebase_idx']})")
+    print(f"  Sample int: {si}  ({n_samples} samples, total {total})")
     print(f"  CH1:        Vpp={trace['ch1_vpp_mV']}mV, "
           f"GND offset={trace['ch1_gnd']}, "
           f"ADC range=[{min(trace['ch1_raw'])}-{max(trace['ch1_raw'])}]")
@@ -437,7 +675,7 @@ def print_info(filepath, trace):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='FNIRSI 1014D oscilloscope WAV trace decoder — '
+        description='FNIRSI oscilloscope WAV trace decoder — '
                     'converts .wav traces to .csv and .png'
     )
     parser.add_argument(
@@ -453,10 +691,37 @@ def main():
         help='Also export in Tektronix-compatible format '
              '(ALL{name}/ directory with per-channel CSV + BMP)'
     )
+    parser.add_argument(
+        '-m', '--model', default='1014d',
+        choices=['1014d', 'dpox180h'],
+        help='Oscilloscope model (default: 1014d)'
+    )
+    parser.add_argument(
+        '--vdiv', metavar='CH1[,CH2]',
+        help='V/div in millivolts for DPOX180H channels, comma-separated '
+             '(e.g. --vdiv 10000,500 for CH1=10V CH2=500mV). '
+             'One value applies to both channels. '
+             'Overrides auto-detection from the file header.'
+    )
     args = parser.parse_args()
 
     if args.output_dir:
         os.makedirs(args.output_dir, exist_ok=True)
+
+    model_name = 'FNIRSI DPOX180H' if args.model == 'dpox180h' else 'FNIRSI 1014D'
+
+    # V/div for DPOX180H
+    ch1_vdiv = ch2_vdiv = None
+    if args.vdiv and args.model == 'dpox180h':
+        parts = [float(x) for x in args.vdiv.split(',')]
+        ch1_vdiv = parts[0]
+        ch2_vdiv = parts[1] if len(parts) > 1 else parts[0]
+
+    if args.model == 'dpox180h':
+        def parse_fn(fp):
+            return parse_trace_dpox180h(fp, ch1_vdiv, ch2_vdiv)
+    else:
+        parse_fn = parse_trace
 
     for filepath in args.files:
         if not os.path.isfile(filepath):
@@ -467,7 +732,7 @@ def main():
         out_dir = args.output_dir or os.path.dirname(filepath) or '.'
 
         try:
-            trace = parse_trace(filepath)
+            trace = parse_fn(filepath)
         except ValueError as e:
             print(f"ERROR: {filepath}: {e}", file=sys.stderr)
             continue
@@ -476,7 +741,7 @@ def main():
         png_path = os.path.join(out_dir, f'{basename}.png')
 
         save_csv(trace, csv_path)
-        save_png(trace, png_path, title=f'FNIRSI 1014D — {basename}')
+        save_png(trace, png_path, title=f'{model_name} — {basename}')
 
         print(f"\n{'='*50}")
         print_info(filepath, trace)
@@ -487,7 +752,7 @@ def main():
             tek_name = basename.zfill(4)
             bundle_dir, ch1_csv, ch2_csv, bmp_path = save_tek_bundle(
                 trace, out_dir, tek_name,
-                title=f'FNIRSI 1014D — {basename}'
+                title=f'{model_name} — {basename}'
             )
             print(f"  TEK dir:    {bundle_dir}")
             print(f"  TEK CH1:    {ch1_csv}")
