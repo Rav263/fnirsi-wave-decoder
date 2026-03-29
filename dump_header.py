@@ -15,9 +15,10 @@ VDIV_TABLE = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000]  # mV
 # Firmware: FUN_0005c98c writes struct+0x290/+0x3D0/+0x510 arrays
 # (3 × u32 per entry) right after display dimensions at 0x2B6.
 # Count stored at file offset 0x1E9 (struct+0x750).
-# Fields after this point are shifted by (settings_size - BASE_SETTINGS_SIZE) bytes.
+# Fields after this point are shifted by (waveform_data_start - BASE_WAV_DATA_START) bytes.
 VAR_TABLE_OFFSET = 0x2B8
-BASE_SETTINGS_SIZE = 11981  # Minimum settings header size (no var table entries)
+BASE_WAV_DATA_START = 11981  # Minimum waveform_data_start when var table is empty
+                             # = 50 (header) + 911 (base settings) + 11020 (screen buffer 102×54×2+4)
 
 
 def fmt_vdiv(idx):
@@ -72,20 +73,22 @@ def f32(data, off):
 # A second structure (DAT_0005d780, trigger/measurements) follows
 # after the variable-length buffer table.
 FIELDS = [
-    # ── 50-byte file header (written by FUN_0005da08) ──
-    (0x00, 4,  "header_const_1 (DAT_0005dbac)",      "KNOWN", "firmware constant"),
-    (0x04, 4,  "header_const_2 (DAT_0005dbb0)",      "KNOWN", "firmware constant"),
-    (0x08, 4,  "header_const_3 (DAT_0005dbb4)",      "KNOWN", "firmware constant"),
-    (0x0C, 4,  "header_const_4 (DAT_0005dbb8)",      "KNOWN", "firmware constant"),
-    (0x10, 4,  "data_start_offset (struct+0x840)",    "USED",  None),
-    (0x14, 4,  "data_section_size (DAT_0005dbbc)",    "USED",  None),
+    # ── Section table (0x00–0x1B, 7×u32 BE, written last by FUN_0005da08) ──
+    # Each section is contiguous: start[N+1] = start[N] + size[N].
+    (0x00, 4,  "settings_start (struct+0x838)",       "USED",  "always 50 (0x32)"),
+    (0x04, 4,  "settings_size (struct+0x844)",        "USED",  None),
+    (0x08, 4,  "screen_buffer_start (struct+0x83c)",  "USED",  None),
+    (0x0C, 4,  "screen_buffer_size (struct+0x848)",   "USED",  None),
+    (0x10, 4,  "waveform_data_start (struct+0x840)",  "USED",  None),
+    (0x14, 4,  "waveform_data_size (struct+0x84c)",   "USED",  None),
     (0x18, 4,  "total_file_size (struct+0x850)",      "USED",  None),
-    (0x1C, 4,  "header gap 0x1C",                     "KNOWN", "between header fields and settings block"),
-    (0x20, 4,  "header gap 0x20",                     "KNOWN", "between header fields and settings block"),
-    (0x24, 4,  "header gap 0x24",                     "KNOWN", "between header fields and settings block"),
-    (0x28, 4,  "header gap 0x28",                     "KNOWN", "between header fields and settings block"),
-    (0x2C, 4,  "header gap 0x2C",                     "KNOWN", "between header fields and settings block"),
-    (0x30, 2,  "header gap 0x30",                     "KNOWN", "between header fields and settings block"),
+    # ── Gap bytes (0x1C–0x31) — constant across all test files, origin unknown ──
+    (0x1C, 4,  "gap 0x1C",                            "?",     "constant across files"),
+    (0x20, 4,  "gap 0x20",                            "?",     "constant across files"),
+    (0x24, 4,  "gap 0x24",                            "?",     "constant across files"),
+    (0x28, 4,  "gap 0x28",                            "?",     "constant across files"),
+    (0x2C, 4,  "gap 0x2C",                            "?",     "constant across files"),
+    (0x30, 2,  "gap 0x30",                            "?",     "constant across files"),
 
     # ── Display settings (struct+0x00..+0x30, file 0x32–0x61) ──
     (0x32, 2,  "grid_columns (struct+0x00)",          "KNOWN", "constant 10"),
@@ -351,19 +354,61 @@ def dump_file(filepath):
         print(f"  ERROR: file too small ({len(data)} bytes)", file=sys.stderr)
         return
 
-    # Structural sizes
-    settings_size = u32(data, 0x10)
-    data_section = u32(data, 0x14)
-    file_size = u32(data, 0x18)
-    samples_per_ch = data_section // 8
-    var_table_size = max(0, settings_size - BASE_SETTINGS_SIZE)
+    # ── Section table (7 × u32 BE at 0x00–0x1B) ──
+    settings_start    = u32(data, 0x00)   # always 50 (0x32)
+    settings_size     = u32(data, 0x04)
+    scr_buf_start     = u32(data, 0x08)
+    scr_buf_size      = u32(data, 0x0C)
+    wav_data_start    = u32(data, 0x10)
+    wav_data_size     = u32(data, 0x14)
+    total_file_size   = u32(data, 0x18)
+
+    # Variable-length buffer table within the settings section
+    var_table_size = max(0, wav_data_start - BASE_WAV_DATA_START)
     var_table_entries = var_table_size // 12  # each entry is 3 × uint32
+
+    # Channel enable flags and sample count
+    ch1_enabled = data[0x66] if len(data) > 0xA7 else 0
+    ch2_enabled = data[0xA6] if len(data) > 0xA7 else 0
+    sample_count = u32(data, 0x12D) if len(data) > 0x131 else 0
 
     print(f"\n{'='*72}")
     print(f"  File: {filepath}")
-    print(f"  Size: {len(data)} bytes "
-          f"(header={settings_size}, data={data_section}, "
-          f"samples/ch={samples_per_ch})")
+    print(f"  Size: {len(data)} bytes  (reported: {total_file_size})")
+    print(f"  Sections:")
+    print(f"    Settings:      0x{settings_start:04X}–0x{settings_start+settings_size-1:04X}"
+          f"  ({settings_size} bytes)")
+    print(f"    Screen buffer: 0x{scr_buf_start:04X}–0x{scr_buf_start+scr_buf_size-1:04X}"
+          f"  ({scr_buf_size} bytes)")
+    print(f"    Waveform data: 0x{wav_data_start:04X}–0x{wav_data_start+wav_data_size-1:04X}"
+          f"  ({wav_data_size} bytes)")
+    print(f"  Channels: CH1={'ON' if ch1_enabled else 'OFF'}"
+          f"  CH2={'ON' if ch2_enabled else 'OFF'}"
+          f"  samples/ch={sample_count}")
+
+    # Section table validation
+    errors = []
+    if settings_start + settings_size != scr_buf_start:
+        errors.append(f"settings end ({settings_start+settings_size}) "
+                      f"!= screen_buffer_start ({scr_buf_start})")
+    if scr_buf_start + scr_buf_size != wav_data_start:
+        errors.append(f"screen_buffer end ({scr_buf_start+scr_buf_size}) "
+                      f"!= waveform_data_start ({wav_data_start})")
+    if wav_data_start + wav_data_size != total_file_size:
+        errors.append(f"waveform end ({wav_data_start+wav_data_size}) "
+                      f"!= total_file_size ({total_file_size})")
+    if total_file_size != len(data):
+        errors.append(f"total_file_size ({total_file_size}) != actual ({len(data)})")
+    active_ch = (1 if ch1_enabled else 0) + (1 if ch2_enabled else 0)
+    if active_ch and sample_count and wav_data_size != active_ch * sample_count * 2:
+        errors.append(f"waveform_data_size ({wav_data_size}) != "
+                      f"{active_ch}ch × {sample_count} × 2 = {active_ch*sample_count*2}")
+    if errors:
+        for e in errors:
+            print(f"  \033[91mVALIDATION ERROR: {e}\033[0m")
+    else:
+        print(f"  \033[32mSection table: OK\033[0m")
+
     if var_table_size > 0:
         print(f"  Var table: {var_table_size} bytes at 0x{VAR_TABLE_OFFSET:X} "
               f"({var_table_entries} triplets of uint32 BE)")
@@ -407,12 +452,12 @@ def dump_file(filepath):
                 print(f"\n  ── No variable buffer table (base settings size) ──")
 
         # Section separators (based on canonical base_offset)
-        if base_offset < 0x10 and last_section != "sig":
-            print(f"  ── File header (0x00–0x31, written by FUN_0005da08) ──")
+        if base_offset < 0x08 and last_section != "sig":
+            print(f"  ── Section table (0x00–0x1B, 7×u32 BE) ──")
             last_section = "sig"
-        elif 0x10 <= base_offset < 0x32 and last_section != "struct":
-            print(f"\n  ── Structural header ──")
-            last_section = "struct"
+        elif 0x1C <= base_offset < 0x32 and last_section != "gap":
+            print(f"\n  ── Gap bytes (0x1C–0x31, constant across files) ──")
+            last_section = "gap"
         elif 0x32 <= base_offset < 0x62 and last_section != "display":
             print(f"\n  ── Display settings (0x32–0x61, struct+0x00..+0x30) ──")
             last_section = "display"
@@ -443,25 +488,57 @@ def dump_file(filepath):
 
         dump_field(data, actual_offset, size, name, status, hint, show_base)
 
-    # ── Quick ADC summary ──
-    print(f"\n  ── ADC data summary ──")
-    adc_block = data_section // 2
-    adc_start = settings_size + adc_block
-    ch_bytes = adc_block // 2
-    spc = ch_bytes // 2
-    if adc_start + adc_block <= len(data) and spc > 0:
-        ch1 = struct.unpack('>' + 'H' * spc,
-                            data[adc_start:adc_start+ch_bytes])
-        ch2 = struct.unpack('>' + 'H' * spc,
-                            data[adc_start+ch_bytes:adc_start+adc_block])
-        ch2_active = any(v != 0 for v in ch2)
-        print(f"  CH1: min={min(ch1)}, max={max(ch1)}, "
-              f"median={sorted(ch1)[spc//2]}, samples={spc}")
-        if ch2_active:
-            print(f"  CH2: min={min(ch2)}, max={max(ch2)}, "
-                  f"median={sorted(ch2)[spc//2]}, samples={spc}")
+    # ── Screen buffer summary ──
+    print(f"\n  ── Screen buffer ──")
+    if scr_buf_start + 4 <= len(data):
+        scr_w = u16(data, scr_buf_start)
+        scr_h = u16(data, scr_buf_start + 2)
+        expected_scr = 4 + scr_w * scr_h * 2
+        print(f"  Dimensions: {scr_w} × {scr_h} pixels (RGB565 u16 BE)")
+        print(f"  Payload: {scr_buf_size} bytes "
+              f"(expected {expected_scr}, "
+              f"{'OK' if expected_scr == scr_buf_size else 'MISMATCH'})")
+    else:
+        print(f"  (not enough data)")
+
+    # ── Waveform data summary ──
+    print(f"\n  ── Waveform data ──")
+    if wav_data_start + wav_data_size <= len(data) and sample_count > 0:
+        off = wav_data_start
+        if ch1_enabled:
+            ch1 = struct.unpack('>' + 'H' * sample_count,
+                                data[off:off + sample_count * 2])
+            vdiv_idx = u16(data, 0x6B) if len(data) > 0x6D else -1
+            vdiv_str = f" ({fmt_vdiv(vdiv_idx)}/div)" if 0 <= vdiv_idx < len(VDIV_TABLE) else ""
+            print(f"  CH1: min={min(ch1)}, max={max(ch1)}, "
+                  f"median={sorted(ch1)[sample_count//2]}, "
+                  f"samples={sample_count}{vdiv_str}")
+            off += sample_count * 2
         else:
-            print(f"  CH2: disabled (all zeros)")
+            print(f"  CH1: disabled")
+        if ch2_enabled:
+            ch2 = struct.unpack('>' + 'H' * sample_count,
+                                data[off:off + sample_count * 2])
+            vdiv_idx = u16(data, 0xAB) if len(data) > 0xAD else -1
+            vdiv_str = f" ({fmt_vdiv(vdiv_idx)}/div)" if 0 <= vdiv_idx < len(VDIV_TABLE) else ""
+            print(f"  CH2: min={min(ch2)}, max={max(ch2)}, "
+                  f"median={sorted(ch2)[sample_count//2]}, "
+                  f"samples={sample_count}{vdiv_str}")
+        else:
+            # Try reading CH2 region anyway to detect non-zero data
+            remaining = wav_data_size - (off - wav_data_start)
+            if remaining >= sample_count * 2:
+                ch2 = struct.unpack('>' + 'H' * sample_count,
+                                    data[off:off + sample_count * 2])
+                if any(v != 0 for v in ch2):
+                    print(f"  CH2: flag=OFF but data present! "
+                          f"min={min(ch2)}, max={max(ch2)}")
+                else:
+                    print(f"  CH2: disabled (no data)")
+            else:
+                print(f"  CH2: disabled (no data section)")
+    else:
+        print(f"  (not enough data or sample_count=0)")
 
     # ── Raw hex dump of first 0x60 bytes ──
     print(f"\n  ── Raw hex: 0x00–0x5F ──")
@@ -473,13 +550,14 @@ def dump_file(filepath):
             for i in range(16) if row_off+i < len(data))
         print(f"  {row_off:04X}: {hex_part:<48s}  {ascii_part}")
 
-    # ── Scan for interesting uint16 BE values in unexplored header ──
-    print(f"\n  ── Interesting values in header (0x160–0x{min(settings_size, 0x400):X}) ──")
+    # ── Scan for interesting uint16 BE values in unexplored settings ──
+    settings_end = settings_start + settings_size
+    print(f"\n  ── Interesting values in settings (0x160–0x{min(settings_end, 0x400):X}) ──")
     interesting = {6400: "ADC center", 12800: "ADC max",
                    10: "10mV", 20: "20mV", 50: "50mV", 100: "100mV",
                    200: "200mV", 500: "500mV", 1000: "1V", 2000: "2V",
                    5000: "5V", 10000: "10V"}
-    scan_end = min(settings_size, 0x400)
+    scan_end = min(settings_end, 0x400)
     found = []
     for off in range(0x160, scan_end - 1, 2):
         v = u16(data, off)

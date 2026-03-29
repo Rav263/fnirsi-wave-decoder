@@ -17,16 +17,20 @@ Supported models:
 
 --- FNIRSI DPOX180H format (variable size) ---
   File structure (firmware-confirmed, FUN_0005da08 + FUN_0005c98c):
-    [0x00..0x31]  50-byte header (7 × u32 BE at 0x00-0x1B, rest padding)
-    [0x32..]      Settings block (oscilloscope state struct dump)
-    [settings..]  Thumbnail (width u16 + height u16 + W×H u16 RGB565)
-    [data_start.. data_start+D/2)   Display buffer (waveform render, skipped)
-    [data_start+D/2 .. end)         ADC data: CH1 then CH2, uint16 BE
+    [0x00..0x31]  50-byte section table (7 × u32 BE at 0x00-0x1B, rest reserved)
+    [0x32..+S)    Settings block (oscilloscope state struct dump)
+    [0x32+S..+B)  Screen buffer (thumbnail: u16 W + u16 H + W×H u16 RGB565)
+    [W..W+D)      Waveform data: ADC samples, uint16 BE
+                  CH1 (if enabled) then CH2 (if enabled), sample_count each
 
-  Header fields (uint32 BE):
-    0x10  data_start_offset (= settings + thumbnail size)
-    0x14  data_section_size (display buffer + ADC data)
-    0x18  total_file_size (= data_start + data_section)
+  Section table (uint32 BE):
+    0x00  settings_start      (always 50 = 0x32)
+    0x04  settings_size
+    0x08  screen_buffer_start
+    0x0C  screen_buffer_size
+    0x10  waveform_data_start (W)
+    0x14  waveform_data_size  (D = active_channels × sample_count × 2)
+    0x18  total_file_size     (= W + D)
 
   Channel enable flags (firmware: struct+0x3C / struct+0xEC):
     0x66  CH1 enabled (uint8, non-zero = on)
@@ -231,11 +235,14 @@ def parse_trace_dpox180h(filepath, ch1_vdiv_mV=None, ch2_vdiv_mV=None):
     """
     Parse an FNIRSI DPOX180H .wav trace file.
 
-    File layout:
-      [0 .. settings_size)                    — settings header
-      [settings_size .. settings_size + D/2)   — display buffer
-      [settings_size + D/2 .. file_end)        — ADC data (CH1 then CH2)
-    where D = data_section_size (from header).
+    File layout (4 contiguous sections):
+      [0x00 .. 0x32)            — section table (7 × u32 BE + reserved)
+      [0x32 .. +settings_size)  — settings (oscilloscope state)
+      [scr_start .. +scr_size)  — screen buffer (RGB565 thumbnail)
+      [wav_start .. +wav_size)  — waveform ADC data (CH1 then CH2, uint16 BE)
+
+    ADC data contains only enabled channels (per flags at 0x66/0xA6),
+    sample_count samples each (from header field 0x12D).
 
     ch1_vdiv_mV / ch2_vdiv_mV: V/div in millivolts for each channel.
       If provided, overrides the value read from the header.
@@ -253,25 +260,38 @@ def parse_trace_dpox180h(filepath, ch1_vdiv_mV=None, ch2_vdiv_mV=None):
             f"File too small for DPOX180H format: {len(data)} bytes"
         )
 
-    # --- Parse structural header (uint32 BE at fixed offsets) ---
-    settings_size = struct.unpack('>I', data[16:20])[0]
-    data_section_size = struct.unpack('>I', data[20:24])[0]
-    file_size_expected = struct.unpack('>I', data[24:28])[0]
+    # --- Parse section table (7 × uint32 BE at 0x00–0x1B) ---
+    settings_start    = struct.unpack('>I', data[0x00:0x04])[0]
+    settings_size     = struct.unpack('>I', data[0x04:0x08])[0]
+    scr_buf_start     = struct.unpack('>I', data[0x08:0x0C])[0]
+    scr_buf_size      = struct.unpack('>I', data[0x0C:0x10])[0]
+    wav_data_start    = struct.unpack('>I', data[0x10:0x14])[0]
+    wav_data_size     = struct.unpack('>I', data[0x14:0x18])[0]
+    total_file_size   = struct.unpack('>I', data[0x18:0x1C])[0]
 
-    if len(data) != file_size_expected:
+    if len(data) != total_file_size:
         raise ValueError(
-            f"DPOX180H: file size mismatch: header says {file_size_expected}, "
+            f"DPOX180H: file size mismatch: header says {total_file_size}, "
             f"actual {len(data)}"
         )
-    if settings_size + data_section_size != file_size_expected:
+    # Validate section continuity invariants
+    if settings_start + settings_size != scr_buf_start:
         raise ValueError(
-            f"DPOX180H: structural inconsistency: "
-            f"settings({settings_size}) + data({data_section_size}) "
-            f"!= file_size({file_size_expected})"
+            f"DPOX180H: section gap: settings end "
+            f"({settings_start + settings_size}) != "
+            f"screen_buffer_start ({scr_buf_start})"
         )
-    if data_section_size % 4 != 0:
+    if scr_buf_start + scr_buf_size != wav_data_start:
         raise ValueError(
-            f"DPOX180H: data section size {data_section_size} not divisible by 4"
+            f"DPOX180H: section gap: screen_buffer end "
+            f"({scr_buf_start + scr_buf_size}) != "
+            f"waveform_data_start ({wav_data_start})"
+        )
+    if wav_data_start + wav_data_size != total_file_size:
+        raise ValueError(
+            f"DPOX180H: section gap: waveform end "
+            f"({wav_data_start + wav_data_size}) != "
+            f"total_file_size ({total_file_size})"
         )
 
     # --- Time/div (uint32 BE at offset 0x1D9, in picoseconds) ---
@@ -293,38 +313,50 @@ def parse_trace_dpox180h(filepath, ch1_vdiv_mV=None, ch2_vdiv_mV=None):
     dual_tb_corrected = False  # kept for backward compatibility
     is_ets = False
 
-    # --- ADC data layout ---
-    adc_block_size = data_section_size // 2
-    adc_start = settings_size + adc_block_size
-    ch_data_bytes = adc_block_size // 2  # bytes per channel
-    samples_per_channel = ch_data_bytes // 2  # uint16 = 2 bytes
-
-    # --- Sample count cross-validation (0x2BC) ---
-    # The header stores the expected sample count per channel at 0x2BC.
-    # Compare with the computed value to detect format mismatches.
-    if len(data) > 0x2C0:
-        header_spc = struct.unpack('>I', data[0x2BC:0x2C0])[0]
-        if header_spc != 0 and header_spc != samples_per_channel:
-            print(f"  Warning: sample count mismatch: header 0x2BC says "
-                  f"{header_spc}, computed {samples_per_channel}",
-                  file=sys.stderr)
-
     # --- Channel enable flags (firmware-confirmed at 0x66/0xA6) ---
-    # When a channel is disabled, its data area may contain non-zero
-    # residual data from previous captures.  The header flag is the
-    # only reliable indicator.
+    # The firmware only writes ADC data for enabled channels.
+    # Disabled channels have no data in the waveform section.
     ch1_enabled_flag = data[DPOX_CH1_ENABLE_OFFSET] != 0
     ch2_enabled_flag = data[DPOX_CH2_ENABLE_OFFSET] != 0
+    active_channels = int(ch1_enabled_flag) + int(ch2_enabled_flag)
 
-    # --- Extract CH1 and CH2 raw samples (uint16 BE) ---
-    ch1_bytes = data[adc_start:adc_start + ch_data_bytes]
-    ch2_bytes = data[adc_start + ch_data_bytes:adc_start + adc_block_size]
+    # --- Sample count per channel ---
+    if active_channels > 0 and wav_data_size > 0:
+        samples_per_channel = wav_data_size // (active_channels * 2)
+    else:
+        samples_per_channel = 0
 
-    ch1_raw = list(struct.unpack('>' + 'H' * samples_per_channel, ch1_bytes))
-    ch2_raw = list(struct.unpack('>' + 'H' * samples_per_channel, ch2_bytes))
+    # Cross-validate with buffer_sample_count at 0x12D
+    if len(data) > 0x131:
+        header_spc = struct.unpack('>I', data[0x12D:0x131])[0]
+        if header_spc != 0 and header_spc != samples_per_channel:
+            print(f"  Warning: sample count: waveform section gives "
+                  f"{samples_per_channel}, header 0x12D says {header_spc}",
+                  file=sys.stderr)
 
-    # Use header enable flag for labeling; always decode CH2 data
-    # (residual data from previous captures may be present even when disabled)
+    if samples_per_channel == 0:
+        raise ValueError("DPOX180H: no waveform data (both channels disabled?)")
+
+    # --- Extract ADC samples from waveform data section ---
+    # Data layout: [CH1 samples if enabled] [CH2 samples if enabled]
+    # Each sample is uint16 BE, sample_count per channel.
+    offset = wav_data_start
+
+    if ch1_enabled_flag:
+        ch1_raw = list(struct.unpack(
+            '>' + 'H' * samples_per_channel,
+            data[offset:offset + samples_per_channel * 2]))
+        offset += samples_per_channel * 2
+    else:
+        ch1_raw = [DPOX_ADC_CENTER] * samples_per_channel
+
+    if ch2_enabled_flag:
+        ch2_raw = list(struct.unpack(
+            '>' + 'H' * samples_per_channel,
+            data[offset:offset + samples_per_channel * 2]))
+    else:
+        ch2_raw = [DPOX_ADC_CENTER] * samples_per_channel
+
     ch2_enabled = ch2_enabled_flag
 
     # --- Time axis ---
@@ -333,19 +365,23 @@ def parse_trace_dpox180h(filepath, ch1_vdiv_mV=None, ch2_vdiv_mV=None):
     display_time_ps = 6 * tdiv_ps  # 6 horizontal divisions
     display_time_s = display_time_ps * 1e-12
 
-    # Choose sample rate: use 0x13D if total time is consistent with
-    # the display (ratio 0.3–3.0×), otherwise compute from display.
-    if adc_sample_rate > 0:
-        total_time_s = samples_per_channel / adc_sample_rate
-        ratio = total_time_s / display_time_s if display_time_s > 0 else 999
-        if 0.3 < ratio < 3.0:
-            sample_rate = adc_sample_rate
-        else:
-            # ETS or inconsistent — derive from display geometry
-            sample_rate = samples_per_channel / display_time_s if display_time_s > 0 else 5_000_000
-            is_ets = sample_rate > 1e9
+    # Choose sample rate: detect ETS by effective display rate, otherwise
+    # use the real ADC sample rate (buffer may be larger than display).
+    eff_rate = samples_per_channel / display_time_s if display_time_s > 0 else 0
+    if eff_rate > 1e9:
+        # Effective rate > 1 GSa/s → ETS (equivalent-time sampling)
+        # The scope reconstructs a fast waveform from many slow captures;
+        # display geometry defines the time axis.
+        sample_rate = eff_rate
+        is_ets = True
+    elif adc_sample_rate > 0:
+        # Real-time mode: use ADC sample rate from 0x13D.
+        # Buffer may contain more samples than screen (long capture).
+        sample_rate = adc_sample_rate
+        is_ets = False
     else:
-        sample_rate = samples_per_channel / display_time_s if display_time_s > 0 else 5_000_000
+        sample_rate = eff_rate if eff_rate > 0 else 5_000_000
+        is_ets = False
 
     sample_interval_ns = 1e9 / sample_rate
     time_ns = [i * sample_interval_ns for i in range(samples_per_channel)]
@@ -429,7 +465,8 @@ def parse_trace_dpox180h(filepath, ch1_vdiv_mV=None, ch2_vdiv_mV=None):
         'sample_rate': sample_rate,
         'samples_per_channel': samples_per_channel,
         'settings_size': settings_size,
-        'data_section_size': data_section_size,
+        'wav_data_start': wav_data_start,
+        'wav_data_size': wav_data_size,
         'model': 'DPOX180H',
         'calibrated': calibrated,
         'vdiv_source': vdiv_source if calibrated else None,

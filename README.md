@@ -117,35 +117,35 @@ V/div auto-detected from header:
   SampleRate: 10 MHz
   Timebase:   100µs/div
   V/div:      CH1=100mV, CH2=200mV  (from header)
-  Sample int: 100ns  (6000 samples, total 599.9µs)
-  CH1:        Vpp=800.0mV, GND offset=6400, ADC range=[0-12800]
+  Sample int: 100ns  (12000 samples, total 1.1999ms)
+  CH1:        Vpp=497.06mV, GND offset=6400, ADC range=[4847-12800]
   CH2:        Vpp=1600.0mV, GND offset=6400, ADC range=[0-12800]
 ```
 
-With `--vdiv` override:
+Long-buffer capture (buffer extends beyond display window):
 ```
 ==================================================
-  File:       19.wav
+  File:       56.wav
   Model:      FNIRSI DPOX180H
   SampleRate: 10 MHz
-  Timebase:   100µs/div
-  V/div:      CH1=500mV, CH2=1V  (from cli)
-  Sample int: 100ns  (6000 samples, total 599.9µs)
-  CH1:        Vpp=4000.0mV, GND offset=6400, ADC range=[0-12800]
-  CH2:        Vpp=8000.0mV, GND offset=6400, ADC range=[0-12800]
+  Timebase:   200µs/div
+  V/div:      CH1=500mV, CH2=500mV  (corrected — stale flag detected)
+  Sample int: 100ns  (48000 samples, total 4.7999ms)
+  CH1:        Vpp=2320.94mV, GND offset=6400, ADC range=[2436-9863]
+  CH2:        Vpp=0.0mV, GND offset=6400, ADC range=[6400-6400] (disabled in header)
 ```
 
 ETS capture (fast timebase, time axis approximate):
 ```
 ==================================================
-  File:       10MHz-1V.wav
+  File:       1MHz-1V.wav
   Model:      FNIRSI DPOX180H
-  SampleRate: 2.5e+04 MHz  (ETS — time axis approximate)
+  SampleRate: 1e+05 MHz  (ETS — time axis approximate)
   Timebase:   5ns/div
-  V/div:      CH1=200mV, CH2=200mV  (from cli)
-  Sample int: 0.04ns  (750 samples, total 29.96ns)
-  CH1:        Vpp=951.74mV, GND offset=6400, ADC range=[2643-10257]
-  CH2:        Vpp=957.37mV, GND offset=6400, ADC range=[2607-10266]
+  V/div:      CH1=100mV, CH2=200mV  (from header)
+  Sample int: 0.01ns  (3000 samples, total 29.99ns)
+  CH1:        Vpp=95.63mV, GND offset=6400, ADC range=[5625-7155]
+  CH2:        Vpp=0.0mV, GND offset=6400, ADC range=[6400-6400] (disabled in header)
 ```
 
 Both V/div flags set (stale warning):
@@ -204,20 +204,33 @@ The file is assembled by `FUN_0005da08` which calls `FUN_0005c98c` to serialize 
 
 ### File structure
 
+The file consists of 4 contiguous sections with no gaps:
+
 | Region | Offset | Size | Description |
 |---|---|---|---|
-| Header | 0x00–0x31 | 50 B | 7 × u32 BE structural fields + padding |
-| Settings block | 0x32.. | variable | Oscilloscope state dump (FUN_0005c98c) |
-| Thumbnail | after settings | variable | RGB565 screenshot (width u16 + height u16 + pixels) |
-| Data section | data_start.. | D bytes | Display buffer (D/2) + ADC data (D/2) |
+| Section table | 0x00–0x31 | 50 B | 7 × u32 BE section offsets/sizes + 22 reserved bytes |
+| Settings | 0x32..+S | variable (~1019 B) | Oscilloscope state dump (FUN_0005c98c) |
+| Screen buffer | 0x32+S..+B | variable (~11020 B) | RGB565 thumbnail (u16 W + u16 H + W×H×2 pixels) |
+| Waveform data | W..W+D | variable | ADC samples: CH1 (if enabled) then CH2 (if enabled), uint16 BE |
 
-### Key header fields
+**Invariant** — sections follow strictly after each other:
+```
+settings_start + settings_size = screen_buffer_start
+screen_buffer_start + screen_buffer_size = waveform_data_start
+waveform_data_start + waveform_data_size = total_file_size
+```
+
+### Key header fields (section table)
 
 | Offset | Type | Description |
 |---|---|---|
-| 0x10 | uint32 BE | Data start offset (= 50 + settings + thumbnail) |
-| 0x14 | uint32 BE | Data section size (display buffer + ADC data) |
-| 0x18 | uint32 BE | Total file size |
+| 0x00 | uint32 BE | Settings start (always 50 = 0x32) — struct+0x838 |
+| 0x04 | uint32 BE | Settings size — struct+0x844 |
+| 0x08 | uint32 BE | Screen buffer start — struct+0x83C |
+| 0x0C | uint32 BE | Screen buffer size — struct+0x848 |
+| 0x10 | uint32 BE | Waveform data start — struct+0x840 |
+| 0x14 | uint32 BE | Waveform data size — struct+0x84C |
+| 0x18 | uint32 BE | Total file size — struct+0x850 |
 | **0x66** | **uint8** | **CH1 channel enabled** (0=off, non-zero=on) — firmware: struct+0x3C |
 | **0xA6** | **uint8** | **CH2 channel enabled** (0=off, non-zero=on) — firmware: struct+0xEC |
 | 0x62 | uint8 | CH1 V/div stale flag (0=current, 1=stale) — firmware: struct+0x38 |
@@ -232,9 +245,9 @@ The file is assembled by `FUN_0005da08` which calls `FUN_0005c98c` to serialize 
 
 The time/div is stored directly at offset **0x1D9** as uint32 BE in **picoseconds** (e.g. 5000 = 5 ns, 5000000 = 5 µs). This gives the exact horizontal scale: total display time = 6 × time/div.
 
-The ADC sample rate at offset **0x13D** (uint32 BE, in Hz) is used for the time axis when it produces a total capture time consistent with the display (within 0.3–3.0× of 6 × time/div).
+The ADC sample rate at offset **0x13D** (uint32 BE, in Hz) gives the real-time sampling rate and is used for the time axis in normal captures. The waveform buffer may contain more samples than fit on the display (long-buffer captures), resulting in actual capture time > display time — this is expected.
 
-For **ETS (Equivalent-Time Sampling)** captures — fast timebases like 5 ns/div where the effective sample rate exceeds 1 GSa/s — offset 0x13D does not match the display time span. In this case, the decoder falls back to `interval = 6 × tdiv / samples_per_channel`, and the time axis is approximate.
+For **ETS (Equivalent-Time Sampling)** captures — fast timebases like 5 ns/div — the decoder computes the effective display rate (`samples / display_time`). If this exceeds **1 GSa/s** (impossible for real-time on this hardware), ETS mode is detected and the time axis uses `interval = 6 × tdiv / samples_per_channel` (approximate).
 
 > **Note:** Offset 0x72 stores a per-channel config constant (typically 200000), **not** the actual capture sample rate. It should not be used for time axis computation.
 
@@ -242,7 +255,7 @@ For **ETS (Equivalent-Time Sampling)** captures — fast timebases like 5 ns/div
 
 The channel enable flags at **0x66** (CH1) and **0xA6** (CH2) are confirmed by firmware disassembly. `FUN_0005da08` checks these flags (`struct+0x3C` for CH1, `struct+0xEC` for CH2) to decide whether to write ADC samples for each channel.
 
-> **Important:** When a channel is disabled, its data area in the file may still contain **non-zero residual data** from previous captures. The header flag is the only reliable way to determine channel state — checking for all-zeros in the data area is incorrect.
+> **Important:** Only enabled channels have data in the waveform section. If only CH1 is enabled, the entire waveform section contains CH1 samples — there is no CH2 block at all. The waveform data size reflects only the enabled channels: `waveform_data_size = active_channels × sample_count × 2`.
 
 ### Stale V/div flags
 
@@ -306,44 +319,52 @@ V/div is stored as an index (0–9) into the standard 1-2-5 sequence:
 
 ### Data layout
 
-`settings_header | display_buffer (D/2 bytes) | ADC_data (D/2 bytes)`
+The waveform data section starts at `waveform_data_start` and contains **only enabled channels**:
 
-ADC data block: first half = CH1, second half = CH2. Format: unsigned uint16 Big-Endian.
+```
+[CH1 data: sample_count × u16 BE]   (if CH1 enabled at 0x66)
+[CH2 data: sample_count × u16 BE]   (if CH2 enabled at 0xA6)
+```
 
-Samples per channel = `data_section_size / 8`.
+- `sample_count` = `waveform_data_size / (active_channels × 2)`
+- Cross-validate with `buffer_sample_count` at offset **0x12D** (u32 BE)
+- If only one channel is enabled, the entire waveform section belongs to that channel
+- Disabled channels have **no data** in the waveform section (not zeros — simply absent)
 
 ### Known file sizes
 
-| Size (bytes) | Settings header | Data section | Samples/ch | Var table | Notes |
-|---|---|---|---|---|---|
-| 18089 | 12089 | 6000 | 750 | 108 B (9 entries) | ETS captures (e.g. 5 ns/div) |
-| 59981 | 11981 | 48000 | 6000 | 0 B | 10 MHz sample rate (e.g. 100 µs/div) |
-| 107993 | 11993 | 96000 | 12000 | 12 B (1 entry) | 400 MHz sample rate (e.g. 5 µs/div) |
+| Size (bytes) | Settings | Screen buf | Waveform | Samples/ch | Channels | Var table | Notes |
+|---|---|---|---|---|---|---|---|
+| 18089 | 1019 | 11020 | 6000 | 3000 | 1 (CH1) | 108 B (9) | ETS captures (5 ns/div) |
+| 59981 | 911 | 11020 | 48000 | 12000 | 2 (both) | 0 B | 10 MHz, dual-channel |
+| 59981 | 911 | 11020 | 48000 | 24000 | 1 (CH1) | 0 B | 10 MHz, single-channel |
+| 107993 | 923 | 11020 | 96000 | 24000 | 2 (both) | 12 B (1) | 50 MHz, dual-channel |
+| 107993 | 923 | 11020 | 96000 | 48000 | 1 (CH1) | 12 B (1) | 10 MHz, single-channel, long buffer |
 
-Constraint: `settings_header_size + data_section_size = total_file_size`.
+Constraint: `settings_start + settings_size + screen_buffer_size + waveform_data_size = total_file_size`.
 
-The settings header has **variable length** — see [Variable-length buffer table](#variable-length-buffer-table) below.
+The settings block has **variable length** — see [Variable-length buffer table](#variable-length-buffer-table) below.
 
-### Settings header detailed map
+### Settings block detailed map
 
-The settings header is ~12 KB with **variable length** (11981–12089 bytes observed). It consists of a 50-byte file header followed by a serialized dump of the oscilloscope's main state structure (`FUN_0005c98c`) and a second structure (trigger/measurements, DAT_0005d780).
+The settings block is ~900–1100 bytes with **variable length** (911–1019 bytes observed). It consists of a serialized dump of the oscilloscope's main state structure (`FUN_0005c98c`) and a second structure (trigger/measurements, DAT_0005d780).
 
-The settings block contains ~644 bytes from the main struct, followed by an optional variable-length buffer table, then ~480+ bytes from the second struct. The remaining ~11 KB consists of display graticule data and firmware lookup tables.
+The settings block contains ~644 bytes from the main struct, followed by an optional variable-length buffer table, then ~280+ bytes from the second struct.
 
-#### File header (0x00–0x31)
+#### Section table (0x00–0x31)
 
-Written by `FUN_0005da08` after the settings block. 50 bytes total: 7 × uint32 BE at 0x00–0x1B, followed by 22 bytes of padding.
+Written **last** by `FUN_0005da08` — the firmware first writes settings, screen buffer and waveform data, records positions via ftell, then seeks to byte 0 and writes the section table. 50 bytes total: 7 × uint32 BE at 0x00–0x1B, followed by 22 reserved bytes.
 
 | Offset | Size | Status | Description |
 |---|---|---|---|
-| 0x00 | uint32 BE | KNOWN | Header constant 1 (DAT_0005dbac) |
-| 0x04 | uint32 BE | KNOWN | Header constant 2 (DAT_0005dbb0) |
-| 0x08 | uint32 BE | KNOWN | Header constant 3 (DAT_0005dbb4) |
-| 0x0C | uint32 BE | KNOWN | Header constant 4 (DAT_0005dbb8) |
-| 0x10 | uint32 BE | USED | Data start offset (struct+0x840) |
-| 0x14 | uint32 BE | USED | Data section size (DAT_0005dbbc) |
+| 0x00 | uint32 BE | USED | Settings start (struct+0x838) — always 50 (0x32) |
+| 0x04 | uint32 BE | USED | Settings size (struct+0x844) |
+| 0x08 | uint32 BE | USED | Screen buffer start (struct+0x83C) |
+| 0x0C | uint32 BE | USED | Screen buffer size (struct+0x848) |
+| 0x10 | uint32 BE | USED | Waveform data start (struct+0x840) |
+| 0x14 | uint32 BE | USED | Waveform data size (struct+0x84C) |
 | 0x18 | uint32 BE | USED | Total file size (struct+0x850) |
-| 0x1C–0x31 | 22 B | KNOWN | Padding between header and settings |
+| 0x1C–0x31 | 22 B | KNOWN | Reserved (constant across all test files) |
 
 #### Display settings (0x32–0x61)
 
@@ -511,26 +532,9 @@ Contains repeating patterns `E3 18` (28× occurrences) and `29 65` — likely di
 
 **Firmware-confirmed** (FUN_0005c98c): The trigger/cursor/math settings are serialized from the main oscilloscope struct at file offsets 0xE4–0x138, interleaved with ~40 standalone DAT globals. Specific fields include trigger mode, trigger edge, trigger level, cursor positions, math/FFT configuration, and acquisition state flags. Individual field identification is in progress — many of the ~40 DAT_* references in the firmware serializer still need mapping to oscilloscope features.
 
-### Display buffer analysis
+### Screen buffer
 
-The display buffer (D/2 bytes, between settings header and ADC data) stores **previously rendered waveform data in screen coordinate space** — not raw ADC values. Key findings:
-
-**Structure**: Two halves of N samples each (uint16 BE):
-- First half ≈ CH1 display data
-- Second half ≈ CH2 display data
-
-**Encoding**: Values are in 0–12800 range (same scale as ADC), but represent **screen-mapped** coordinates:
-```
-display_value = GND_screen_position_in_12800_scale - (adc - 6400) * display_scale
-```
-where `display_scale` depends on V/div and the 300-pixel waveform area height.
-
-**Key properties**:
-- **Heavily quantized**: only 8–70 unique values per file (vs 100–400 for ADC), reflecting screen pixel resolution
-- **Different capture frame**: near-zero per-sample correlation with the saved ADC data (r < 0.05 for most files), because the display shows a previous trigger event, not the currently saved one
-- **Same waveform shape**: when trigger is stable, correlation can reach r=0.76 (file 20.wav), and sorted-value correlation is higher (up to 0.84)
-- **Different value range**: display values include V/div scaling and vertical position offset (e.g., ADC range 3700–9000 maps to display range 10400–10700 when channel is positioned near screen bottom)
-- **Not useful for signal reconstruction**: strictly less precise than the ADC data — the decoder correctly ignores this region
+The screen buffer section (~11020 bytes typically) stores a screenshot of the oscilloscope display as an RGB565 bitmap, prefixed by uint16 BE width and uint16 BE height. This is a thumbnail of the oscilloscope's LCD at the moment of capture. Not useful for signal reconstruction.
 
 ### Header dump utility
 
