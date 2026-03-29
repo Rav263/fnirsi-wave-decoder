@@ -16,14 +16,33 @@ Supported models:
   Extra:     bytes 7000+     (additional data, ignored)
 
 --- FNIRSI DPOX180H format (variable size) ---
+  File structure (firmware-confirmed, FUN_0005da08 + FUN_0005c98c):
+    [0x00..0x31]  50-byte header (7 × u32 BE at 0x00-0x1B, rest padding)
+    [0x32..]      Settings block (oscilloscope state struct dump)
+    [settings..]  Thumbnail (width u16 + height u16 + W×H u16 RGB565)
+    [data_start.. data_start+D/2)   Display buffer (waveform render, skipped)
+    [data_start+D/2 .. end)         ADC data: CH1 then CH2, uint16 BE
+
   Header fields (uint32 BE):
-    bytes[16:20]  settings header size
-    bytes[20:24]  data section size (display buffer + ADC, split 50/50)
-    bytes[24:28]  total file size
-  Sample rate (uint32 BE) at byte offset 0x72.
-  ADC data: unsigned uint16 Big-Endian, CH1 then CH2.
-  ADC block starts at: settings_size + data_section_size / 2
-  Samples per channel = data_section_size / 8
+    0x10  data_start_offset (= settings + thumbnail size)
+    0x14  data_section_size (display buffer + ADC data)
+    0x18  total_file_size (= data_start + data_section)
+
+  Channel enable flags (firmware: struct+0x3C / struct+0xEC):
+    0x66  CH1 enabled (uint8, non-zero = on)
+    0xA6  CH2 enabled (uint8, non-zero = on)
+
+  V/div indices (uint16 BE, standard 1-2-5 table 0-9):
+    0x6A  CH1 V/div index
+    0xAA  CH2 V/div index
+
+  Stale V/div flags (uint8, 0=current, 1=stale from prev capture):
+    0x62  CH1 stale flag
+    0xA2  CH2 stale flag
+
+  Time/div in picoseconds (uint32 BE) at 0x1D9.
+  ADC sample rate in Hz (uint32 BE) at 0x13D.
+  ADC calibration: voltage_mV = (adc - 6400) * vdiv_mV / 1600
 """
 
 import struct
@@ -132,12 +151,9 @@ def parse_trace(filepath):
     ch1_vpp_mV = vals[105]
     ch2_vpp_mV = vals[129] if ch2_enabled else 0
 
-    # --- Extract raw samples ---
+    # --- Extract raw samples (always decode both channels) ---
     ch1_raw = list(vals[CH1_START:CH1_START + SAMPLES_PER_CHANNEL])
-    ch2_raw = (
-        list(vals[CH2_START:CH2_START + SAMPLES_PER_CHANNEL])
-        if ch2_enabled else None
-    )
+    ch2_raw = list(vals[CH2_START:CH2_START + SAMPLES_PER_CHANNEL])
 
     # --- Time axis ---
     ns_per_div = TIMEBASE_NS_PER_DIV.get(timebase_idx)
@@ -162,7 +178,7 @@ def parse_trace(filepath):
         return [round((v - gnd_offset) * mV_per_count, 2) for v in raw_samples]
 
     ch1_mV = adc_to_mV(ch1_raw, ch1_gnd, ch1_vpp_mV)
-    ch2_mV = adc_to_mV(ch2_raw, ch2_gnd, ch2_vpp_mV) if ch2_raw else None
+    ch2_mV = adc_to_mV(ch2_raw, ch2_gnd, ch2_vpp_mV if ch2_enabled else ch1_vpp_mV)
 
     return {
         'ch1_raw': ch1_raw,
@@ -191,11 +207,16 @@ DPOX_COUNTS_PER_DIV = DPOX_ADC_MAX // DPOX_N_VDIV  # 1600
 # Standard V/div table (mV), indexed 0-9
 DPOX_VDIV_TABLE = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000]
 
-# Header offsets for per-channel V/div index (uint16 BE)
-# Two config blocks: Block1 (CH1) at 0x60, Block2 (CH2) at 0xA0
-# V/div index at relative offset +0x0A within each block
-DPOX_CH1_VDIV_IDX_OFFSET = 0x6A  # Block1 + 0x0A
-DPOX_CH2_VDIV_IDX_OFFSET = 0xAA  # Block2 + 0x0A
+# Header offsets (firmware: FUN_0005c98c serialises oscilloscope state struct)
+# V/div index: struct+0x42 (CH1) / struct+0xF2 (CH2), written as u8(pad)+u16
+# The u16BE read at 0x6A works because the pad byte (struct+0x40) is always 0.
+DPOX_CH1_VDIV_IDX_OFFSET = 0x6A  # struct+0x40(1B) + struct+0x42(2B)
+DPOX_CH2_VDIV_IDX_OFFSET = 0xAA  # struct+0xF0(1B) + struct+0xF2(2B)
+
+# Channel enable flags (firmware: struct+0x3C for CH1, struct+0xEC for CH2)
+# FUN_0005da08 checks these to decide whether to write CH1/CH2 ADC samples.
+DPOX_CH1_ENABLE_OFFSET = 0x66
+DPOX_CH2_ENABLE_OFFSET = 0xA6
 
 
 def _dpox_read_vdiv(data, offset):
@@ -253,18 +274,47 @@ def parse_trace_dpox180h(filepath, ch1_vdiv_mV=None, ch2_vdiv_mV=None):
             f"DPOX180H: data section size {data_section_size} not divisible by 4"
         )
 
-    # --- Sample rate (uint32 BE at offset 0x72) ---
-    sample_rate = struct.unpack('>I', data[0x72:0x76])[0]
-    if sample_rate == 0:
-        print("  Warning: sample rate is 0, defaulting to 5 MHz",
+    # --- Time/div (uint32 BE at offset 0x1D9, in picoseconds) ---
+    tdiv_ps = struct.unpack('>I', data[0x1D9:0x1DD])[0]
+    if tdiv_ps == 0:
+        print("  Warning: time/div is 0, defaulting to 1µs",
               file=sys.stderr)
-        sample_rate = 5_000_000
+        tdiv_ps = 1_000_000  # 1µs in picoseconds
+
+    # --- Sample rate ---
+    # Primary: ADC sample rate at 0x13D (uint32 BE).
+    # For real-time captures this equals 6 * tdiv / spc exactly.
+    # For ETS captures (effective rate > 1 GSa/s) the value at 0x13D
+    # does not match the display time span; fall back to display formula.
+    adc_sample_rate = struct.unpack('>I', data[0x13D:0x141])[0]
+    dual_tb_flag_ch1 = data[0x62]
+    dual_tb_flag_ch2 = data[0xA2]
+    original_sample_rate = adc_sample_rate
+    dual_tb_corrected = False  # kept for backward compatibility
+    is_ets = False
 
     # --- ADC data layout ---
     adc_block_size = data_section_size // 2
     adc_start = settings_size + adc_block_size
     ch_data_bytes = adc_block_size // 2  # bytes per channel
     samples_per_channel = ch_data_bytes // 2  # uint16 = 2 bytes
+
+    # --- Sample count cross-validation (0x2BC) ---
+    # The header stores the expected sample count per channel at 0x2BC.
+    # Compare with the computed value to detect format mismatches.
+    if len(data) > 0x2C0:
+        header_spc = struct.unpack('>I', data[0x2BC:0x2C0])[0]
+        if header_spc != 0 and header_spc != samples_per_channel:
+            print(f"  Warning: sample count mismatch: header 0x2BC says "
+                  f"{header_spc}, computed {samples_per_channel}",
+                  file=sys.stderr)
+
+    # --- Channel enable flags (firmware-confirmed at 0x66/0xA6) ---
+    # When a channel is disabled, its data area may contain non-zero
+    # residual data from previous captures.  The header flag is the
+    # only reliable indicator.
+    ch1_enabled_flag = data[DPOX_CH1_ENABLE_OFFSET] != 0
+    ch2_enabled_flag = data[DPOX_CH2_ENABLE_OFFSET] != 0
 
     # --- Extract CH1 and CH2 raw samples (uint16 BE) ---
     ch1_bytes = data[adc_start:adc_start + ch_data_bytes]
@@ -273,18 +323,32 @@ def parse_trace_dpox180h(filepath, ch1_vdiv_mV=None, ch2_vdiv_mV=None):
     ch1_raw = list(struct.unpack('>' + 'H' * samples_per_channel, ch1_bytes))
     ch2_raw = list(struct.unpack('>' + 'H' * samples_per_channel, ch2_bytes))
 
-    # Detect if CH2 is actually used (not all zeros)
-    ch2_enabled = any(v != 0 for v in ch2_raw)
-    if not ch2_enabled:
-        ch2_raw = None
+    # Use header enable flag for labeling; always decode CH2 data
+    # (residual data from previous captures may be present even when disabled)
+    ch2_enabled = ch2_enabled_flag
 
     # --- Time axis ---
+    # ns_per_div is known exactly from 0x1D9
+    ns_per_div = tdiv_ps / 1000.0
+    display_time_ps = 6 * tdiv_ps  # 6 horizontal divisions
+    display_time_s = display_time_ps * 1e-12
+
+    # Choose sample rate: use 0x13D if total time is consistent with
+    # the display (ratio 0.3–3.0×), otherwise compute from display.
+    if adc_sample_rate > 0:
+        total_time_s = samples_per_channel / adc_sample_rate
+        ratio = total_time_s / display_time_s if display_time_s > 0 else 999
+        if 0.3 < ratio < 3.0:
+            sample_rate = adc_sample_rate
+        else:
+            # ETS or inconsistent — derive from display geometry
+            sample_rate = samples_per_channel / display_time_s if display_time_s > 0 else 5_000_000
+            is_ets = sample_rate > 1e9
+    else:
+        sample_rate = samples_per_channel / display_time_s if display_time_s > 0 else 5_000_000
+
     sample_interval_ns = 1e9 / sample_rate
     time_ns = [i * sample_interval_ns for i in range(samples_per_channel)]
-
-    # Estimate ns_per_div: total_time / 6 divisions (DPOX180H display)
-    total_time_ns = time_ns[-1] if len(time_ns) > 1 else sample_interval_ns
-    ns_per_div = total_time_ns / 6.0
 
     # --- V/div: CLI override → header auto-detect → uncalibrated fallback ---
     vdiv_source = 'cli' if (ch1_vdiv_mV is not None or ch2_vdiv_mV is not None) else None
@@ -295,6 +359,30 @@ def parse_trace_dpox180h(filepath, ch1_vdiv_mV=None, ch2_vdiv_mV=None):
     if ch2_vdiv_mV is None:
         ch2_vdiv_mV = _dpox_read_vdiv(data, DPOX_CH2_VDIV_IDX_OFFSET)
 
+    # --- Stale V/div correction ---
+    # When a channel's flag (0x62 for CH1, 0xA2 for CH2) is 1, the V/div
+    # index stored in the header is stale (from a previous capture).
+    # If exactly one flag is set, the non-flagged channel has the correct
+    # V/div; copy it to the flagged channel.
+    # If both flags are set, both V/div are stale and no auto-fix is
+    # possible — warn the user.
+    vdiv_corrected = False
+    both_vdiv_stale = False
+    if vdiv_source != 'cli':
+        if dual_tb_flag_ch1 == 1 and dual_tb_flag_ch2 == 0 and ch2_vdiv_mV is not None:
+            ch1_vdiv_mV = ch2_vdiv_mV
+            vdiv_corrected = True
+        elif dual_tb_flag_ch2 == 1 and dual_tb_flag_ch1 == 0 and ch1_vdiv_mV is not None:
+            ch2_vdiv_mV = ch1_vdiv_mV
+            vdiv_corrected = True
+        elif dual_tb_flag_ch1 == 1 and dual_tb_flag_ch2 == 1:
+            both_vdiv_stale = True
+            print("  Warning: both V/div flags are set — stored V/div "
+                  f"(CH1={_format_vdiv(ch1_vdiv_mV) if ch1_vdiv_mV else '?'}, "
+                  f"CH2={_format_vdiv(ch2_vdiv_mV) if ch2_vdiv_mV else '?'}) "
+                  "may be stale. Use --vdiv to override.",
+                  file=sys.stderr)
+
     calibrated = ch1_vdiv_mV is not None
     ch1_gnd = DPOX_ADC_CENTER
     ch2_gnd = DPOX_ADC_CENTER
@@ -304,13 +392,10 @@ def parse_trace_dpox180h(filepath, ch1_vdiv_mV=None, ch2_vdiv_mV=None):
         ch1_mV_per_count = ch1_vdiv_mV / DPOX_COUNTS_PER_DIV
         ch1_mV = [round((v - DPOX_ADC_CENTER) * ch1_mV_per_count, 2)
                   for v in ch1_raw]
-        if ch2_raw:
-            c2_vdiv = ch2_vdiv_mV if ch2_vdiv_mV is not None else ch1_vdiv_mV
-            ch2_mV_per_count = c2_vdiv / DPOX_COUNTS_PER_DIV
-            ch2_mV = [round((v - DPOX_ADC_CENTER) * ch2_mV_per_count, 2)
-                      for v in ch2_raw]
-        else:
-            ch2_mV = None
+        c2_vdiv = ch2_vdiv_mV if ch2_vdiv_mV is not None else ch1_vdiv_mV
+        ch2_mV_per_count = c2_vdiv / DPOX_COUNTS_PER_DIV
+        ch2_mV = [round((v - DPOX_ADC_CENTER) * ch2_mV_per_count, 2)
+                  for v in ch2_raw]
     else:
         # Uncalibrated fallback: 10 mV/count from median-based GND
         def estimate_gnd(raw_samples):
@@ -318,11 +403,10 @@ def parse_trace_dpox180h(filepath, ch1_vdiv_mV=None, ch2_vdiv_mV=None):
             n = len(s)
             return (s[n // 2] + s[(n - 1) // 2]) / 2
         ch1_gnd = int(estimate_gnd(ch1_raw))
-        ch2_gnd = int(estimate_gnd(ch2_raw)) if ch2_raw else 0
+        ch2_gnd = int(estimate_gnd(ch2_raw))
         mV_per_count = 10.0
         ch1_mV = [round((v - ch1_gnd) * mV_per_count, 2) for v in ch1_raw]
-        ch2_mV = ([round((v - ch2_gnd) * mV_per_count, 2) for v in ch2_raw]
-                  if ch2_raw else None)
+        ch2_mV = [round((v - ch2_gnd) * mV_per_count, 2) for v in ch2_raw]
 
     # Vpp from data
     ch1_vpp_mV = round(max(ch1_mV) - min(ch1_mV), 2) if ch1_mV else 0
@@ -351,6 +435,12 @@ def parse_trace_dpox180h(filepath, ch1_vdiv_mV=None, ch2_vdiv_mV=None):
         'vdiv_source': vdiv_source if calibrated else None,
         'ch1_vdiv_mV': ch1_vdiv_mV,
         'ch2_vdiv_mV': ch2_vdiv_mV if ch2_vdiv_mV is not None else ch1_vdiv_mV,
+        'dual_tb_corrected': dual_tb_corrected,
+        'original_sample_rate': original_sample_rate,
+        'is_ets': is_ets,
+        'tdiv_ps': tdiv_ps,
+        'vdiv_corrected': vdiv_corrected,
+        'both_vdiv_stale': both_vdiv_stale,
     }
 
 
@@ -368,26 +458,17 @@ def save_csv(trace, output_path):
     with open(output_path, 'w', newline='') as f:
         writer = csv.writer(f)
 
-        if trace['ch2_enabled']:
+        writer.writerow([
+            'time_ns', 'ch1_mV', 'ch2_mV', 'ch1_raw', 'ch2_raw'
+        ])
+        for i in range(n_samples):
             writer.writerow([
-                'time_ns', 'ch1_mV', 'ch2_mV', 'ch1_raw', 'ch2_raw'
+                f"{trace['time_ns'][i]:.2f}",
+                f"{trace['ch1_mV'][i]:.2f}",
+                f"{trace['ch2_mV'][i]:.2f}",
+                trace['ch1_raw'][i],
+                trace['ch2_raw'][i],
             ])
-            for i in range(n_samples):
-                writer.writerow([
-                    f"{trace['time_ns'][i]:.2f}",
-                    f"{trace['ch1_mV'][i]:.2f}",
-                    f"{trace['ch2_mV'][i]:.2f}",
-                    trace['ch1_raw'][i],
-                    trace['ch2_raw'][i],
-                ])
-        else:
-            writer.writerow(['time_ns', 'ch1_mV', 'ch1_raw'])
-            for i in range(n_samples):
-                writer.writerow([
-                    f"{trace['time_ns'][i]:.2f}",
-                    f"{trace['ch1_mV'][i]:.2f}",
-                    trace['ch1_raw'][i],
-                ])
 
 
 def choose_time_units(max_ns):
@@ -429,16 +510,16 @@ def save_png(trace, output_path, title=''):
     ax.plot(time_plot, trace['ch1_mV'],
             label=ch1_label, color='#FFD700', linewidth=0.8)
 
-    if trace['ch2_enabled']:
-        if is_dpox and dpox_cal:
-            ch2_vd = trace.get('ch2_vdiv_mV', 0)
-            ch2_label = f"CH2 ({_format_vdiv(ch2_vd)}/div)"
-        elif is_dpox:
-            ch2_label = 'CH2'
-        else:
-            ch2_label = f"CH2 (Vpp={trace['ch2_vpp_mV']}mV)"
-        ax.plot(time_plot, trace['ch2_mV'],
-                label=ch2_label, color='#00FFFF', linewidth=0.8)
+    ch2_disabled_tag = '' if trace['ch2_enabled'] else ' [off]'
+    if is_dpox and dpox_cal:
+        ch2_vd = trace.get('ch2_vdiv_mV', 0)
+        ch2_label = f"CH2 ({_format_vdiv(ch2_vd)}/div){ch2_disabled_tag}"
+    elif is_dpox:
+        ch2_label = f"CH2{ch2_disabled_tag}"
+    else:
+        ch2_label = f"CH2 (Vpp={trace['ch2_vpp_mV']}mV){ch2_disabled_tag}"
+    ax.plot(time_plot, trace['ch2_mV'],
+            label=ch2_label, color='#00FFFF', linewidth=0.8)
 
     # Styling (dark oscilloscope theme)
     ax.set_xlabel(f'Time ({unit})', color='white')
@@ -488,16 +569,16 @@ def save_plot(trace, output_path, title='', fmt='png'):
     ax.plot(time_plot, trace['ch1_mV'],
             label=ch1_label, color='#FFD700', linewidth=0.8)
 
-    if trace['ch2_enabled']:
-        if is_dpox and dpox_cal:
-            ch2_vd = trace.get('ch2_vdiv_mV', 0)
-            ch2_label = f"CH2 ({_format_vdiv(ch2_vd)}/div)"
-        elif is_dpox:
-            ch2_label = 'CH2'
-        else:
-            ch2_label = f"CH2 (Vpp={trace['ch2_vpp_mV']}mV)"
-        ax.plot(time_plot, trace['ch2_mV'],
-                label=ch2_label, color='#00FFFF', linewidth=0.8)
+    ch2_disabled_tag = '' if trace['ch2_enabled'] else ' [off]'
+    if is_dpox and dpox_cal:
+        ch2_vd = trace.get('ch2_vdiv_mV', 0)
+        ch2_label = f"CH2 ({_format_vdiv(ch2_vd)}/div){ch2_disabled_tag}"
+    elif is_dpox:
+        ch2_label = f"CH2{ch2_disabled_tag}"
+    else:
+        ch2_label = f"CH2 (Vpp={trace['ch2_vpp_mV']}mV){ch2_disabled_tag}"
+    ax.plot(time_plot, trace['ch2_mV'],
+            label=ch2_label, color='#00FFFF', linewidth=0.8)
 
     ax.set_xlabel(f'Time ({unit})', color='white')
     ax.set_ylabel(y_label, color='white')
@@ -545,7 +626,7 @@ def save_tek_csv(trace, output_path, channel='CH1'):
     ns_per_div = trace['ns_per_div']
     h_scale_s = ns_per_div * 1e-9
 
-    if channel == 'CH2' and trace['ch2_enabled']:
+    if channel == 'CH2':
         mV_data = trace['ch2_mV']
         vpp_mV = trace['ch2_vpp_mV']
         source = 'CH2'
@@ -623,11 +704,9 @@ def save_tek_bundle(trace, out_dir, name, title=''):
     ch1_csv = os.path.join(bundle_dir, f'F{name}CH1.CSV')
     save_tek_csv(trace, ch1_csv, channel='CH1')
 
-    # CH2 CSV (if enabled)
-    ch2_csv = None
-    if trace['ch2_enabled']:
-        ch2_csv = os.path.join(bundle_dir, f'F{name}CH2.CSV')
-        save_tek_csv(trace, ch2_csv, channel='CH2')
+    # CH2 CSV
+    ch2_csv = os.path.join(bundle_dir, f'F{name}CH2.CSV')
+    save_tek_csv(trace, ch2_csv, channel='CH2')
 
     # BMP plot
     bmp_path = os.path.join(bundle_dir, f'F{name}TEK.BMP')
@@ -650,13 +729,19 @@ def print_info(filepath, trace):
     if model == 'DPOX180H':
         sr = trace.get('sample_rate', 0)
         sr_str = f"{sr/1e6:.3g} MHz" if sr >= 1e6 else f"{sr/1e3:.3g} kHz"
-        print(f"  SampleRate: {sr_str}")
-        print(f"  Timebase:   {tb}  (estimated)")
+        ets_note = "  (ETS — time axis approximate)" if trace.get('is_ets') else ""
+        print(f"  SampleRate: {sr_str}{ets_note}")
+        print(f"  Timebase:   {tb}")
         if trace.get('calibrated'):
             ch1_vd = trace.get('ch1_vdiv_mV', 0)
             ch2_vd = trace.get('ch2_vdiv_mV', 0)
             src = trace.get('vdiv_source', 'unknown')
-            print(f"  V/div:      CH1={_format_vdiv(ch1_vd)}, CH2={_format_vdiv(ch2_vd)}  (from {src})")
+            if trace.get('both_vdiv_stale'):
+                print(f"  V/div:      CH1={_format_vdiv(ch1_vd)} (possibly stale), CH2={_format_vdiv(ch2_vd)} (possibly stale)  (from {src})")
+            elif trace.get('vdiv_corrected'):
+                print(f"  V/div:      CH1={_format_vdiv(ch1_vd)}, CH2={_format_vdiv(ch2_vd)}  (corrected — stale flag detected)")
+            else:
+                print(f"  V/div:      CH1={_format_vdiv(ch1_vd)}, CH2={_format_vdiv(ch2_vd)}  (from {src})")
         else:
             print(f"  V/div:      not detected (use --vdiv to calibrate)")
     else:
@@ -665,12 +750,11 @@ def print_info(filepath, trace):
     print(f"  CH1:        Vpp={trace['ch1_vpp_mV']}mV, "
           f"GND offset={trace['ch1_gnd']}, "
           f"ADC range=[{min(trace['ch1_raw'])}-{max(trace['ch1_raw'])}]")
-    if trace['ch2_enabled']:
-        print(f"  CH2:        Vpp={trace['ch2_vpp_mV']}mV, "
-              f"GND offset={trace['ch2_gnd']}, "
-              f"ADC range=[{min(trace['ch2_raw'])}-{max(trace['ch2_raw'])}]")
-    else:
-        print(f"  CH2:        disabled")
+    ch2_status = '' if trace['ch2_enabled'] else ' (disabled in header)'
+    print(f"  CH2:        Vpp={trace['ch2_vpp_mV']}mV, "
+          f"GND offset={trace['ch2_gnd']}, "
+          f"ADC range=[{min(trace['ch2_raw'])}-{max(trace['ch2_raw'])}]"
+          f"{ch2_status}")
 
 
 def main():

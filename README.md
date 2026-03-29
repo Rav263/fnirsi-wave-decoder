@@ -114,10 +114,10 @@ V/div auto-detected from header:
 ==================================================
   File:       19.wav
   Model:      FNIRSI DPOX180H
-  SampleRate: 5 MHz
-  Timebase:   199.967µs/div  (estimated)
+  SampleRate: 10 MHz
+  Timebase:   100µs/div
   V/div:      CH1=100mV, CH2=200mV  (from header)
-  Sample int: 200ns  (6000 samples, total 1.1998ms)
+  Sample int: 100ns  (6000 samples, total 599.9µs)
   CH1:        Vpp=800.0mV, GND offset=6400, ADC range=[0-12800]
   CH2:        Vpp=1600.0mV, GND offset=6400, ADC range=[0-12800]
 ```
@@ -127,12 +127,30 @@ With `--vdiv` override:
 ==================================================
   File:       19.wav
   Model:      FNIRSI DPOX180H
-  SampleRate: 5 MHz
-  Timebase:   199.967µs/div  (estimated)
+  SampleRate: 10 MHz
+  Timebase:   100µs/div
   V/div:      CH1=500mV, CH2=1V  (from cli)
-  Sample int: 200ns  (6000 samples, total 1.1998ms)
+  Sample int: 100ns  (6000 samples, total 599.9µs)
   CH1:        Vpp=4000.0mV, GND offset=6400, ADC range=[0-12800]
   CH2:        Vpp=8000.0mV, GND offset=6400, ADC range=[0-12800]
+```
+
+ETS capture (fast timebase, time axis approximate):
+```
+==================================================
+  File:       10MHz-1V.wav
+  Model:      FNIRSI DPOX180H
+  SampleRate: 2.5e+04 MHz  (ETS — time axis approximate)
+  Timebase:   5ns/div
+  V/div:      CH1=200mV, CH2=200mV  (from cli)
+  Sample int: 0.04ns  (750 samples, total 29.96ns)
+  CH1:        Vpp=951.74mV, GND offset=6400, ADC range=[2643-10257]
+  CH2:        Vpp=957.37mV, GND offset=6400, ADC range=[2607-10266]
+```
+
+Both V/div flags set (stale warning):
+```
+  Warning: both V/div flags are set — stored V/div (CH1=100mV, CH2=200mV) may be stale. Use --vdiv to override.
 ```
 
 > **Calibration formula:** `voltage_mV = (adc_value - 6400) * vdiv_mV / 1600`
@@ -180,29 +198,87 @@ MIT
 
 ## FNIRSI DPOX180H WAV file format
 
-Trace files have **variable size** (e.g. 59981 or 107993 bytes). Structure is described by three uint32 Big-Endian fields in the header:
+Trace files have **variable size** (e.g. 59981 or 107993 bytes). The format has been fully reverse-engineered from firmware (V40, Allwinner F1C100s/F1C200s ARM SoC) using Ghidra disassembly.
 
-| Offset (bytes) | Type | Description |
+The file is assembled by `FUN_0005da08` which calls `FUN_0005c98c` to serialize the oscilloscope state structure. The writer (`FUN_000315d4`) converts native ARM little-endian values to Big-Endian on write.
+
+### File structure
+
+| Region | Offset | Size | Description |
+|---|---|---|---|
+| Header | 0x00–0x31 | 50 B | 7 × u32 BE structural fields + padding |
+| Settings block | 0x32.. | variable | Oscilloscope state dump (FUN_0005c98c) |
+| Thumbnail | after settings | variable | RGB565 screenshot (width u16 + height u16 + pixels) |
+| Data section | data_start.. | D bytes | Display buffer (D/2) + ADC data (D/2) |
+
+### Key header fields
+
+| Offset | Type | Description |
 |---|---|---|
-| 16–19 | uint32 BE | Settings header size |
-| 20–23 | uint32 BE | Data section size (display buffer + ADC data, split 50/50) |
-| 24–27 | uint32 BE | Total file size |
-| 0x72–0x75 | uint32 BE | Sample rate in Hz (e.g. 5000000 = 5 MHz) |
+| 0x10 | uint32 BE | Data start offset (= 50 + settings + thumbnail) |
+| 0x14 | uint32 BE | Data section size (display buffer + ADC data) |
+| 0x18 | uint32 BE | Total file size |
+| **0x66** | **uint8** | **CH1 channel enabled** (0=off, non-zero=on) — firmware: struct+0x3C |
+| **0xA6** | **uint8** | **CH2 channel enabled** (0=off, non-zero=on) — firmware: struct+0xEC |
+| 0x62 | uint8 | CH1 V/div stale flag (0=current, 1=stale) — firmware: struct+0x38 |
+| 0xA2 | uint8 | CH2 V/div stale flag (0=current, 1=stale) — firmware: struct+0xE8 |
+| 0x6A | uint16 BE | CH1 V/div index (0-9) — firmware: struct+0x40(pad) + struct+0x42 |
+| 0xAA | uint16 BE | CH2 V/div index (0-9) — firmware: struct+0xF0(pad) + struct+0xF2 |
+| 0x13D | uint32 BE | ADC sample rate in Hz — firmware: struct+0x664 |
+| 0x1D4 | uint8 | Timebase index — firmware: DAT_0005d6a4 |
+| 0x1D9 | uint32 BE | Time/div in picoseconds — firmware: struct+0x714 |
+
+### Time axis computation
+
+The time/div is stored directly at offset **0x1D9** as uint32 BE in **picoseconds** (e.g. 5000 = 5 ns, 5000000 = 5 µs). This gives the exact horizontal scale: total display time = 6 × time/div.
+
+The ADC sample rate at offset **0x13D** (uint32 BE, in Hz) is used for the time axis when it produces a total capture time consistent with the display (within 0.3–3.0× of 6 × time/div).
+
+For **ETS (Equivalent-Time Sampling)** captures — fast timebases like 5 ns/div where the effective sample rate exceeds 1 GSa/s — offset 0x13D does not match the display time span. In this case, the decoder falls back to `interval = 6 × tdiv / samples_per_channel`, and the time axis is approximate.
+
+> **Note:** Offset 0x72 stores a per-channel config constant (typically 200000), **not** the actual capture sample rate. It should not be used for time axis computation.
+
+### Channel enable flags
+
+The channel enable flags at **0x66** (CH1) and **0xA6** (CH2) are confirmed by firmware disassembly. `FUN_0005da08` checks these flags (`struct+0x3C` for CH1, `struct+0xEC` for CH2) to decide whether to write ADC samples for each channel.
+
+> **Important:** When a channel is disabled, its data area in the file may still contain **non-zero residual data** from previous captures. The header flag is the only reliable way to determine channel state — checking for all-zeros in the data area is incorrect.
+
+### Stale V/div flags
+
+The flags at bytes `0x62` (CH1) and `0xA2` (CH2) also indicate that the stored V/div is stale (leftover from a previous capture). This is independent of the sample rate correction:
+
+- **One flag set** — the flagged channel's V/div is replaced with the non-flagged channel's V/div:
+  - CH1 flagged (`0x62 = 0x01`), CH2 not → CH1 inherits CH2's V/div
+  - CH2 flagged (`0xA2 = 0x01`), CH1 not → CH2 inherits CH1's V/div
+- **Both flags set** — both V/div values may be stale. The decoder prints a warning and keeps the header values. Use `--vdiv` to override.
+
+The `--vdiv` CLI override bypasses all V/div auto-correction.
 
 ### Per-channel configuration blocks
 
-The header contains two configuration blocks with identical structure — one per channel:
+The settings block (starting at file offset 0x32) contains the serialized oscilloscope state structure. Channel config is written by `FUN_0005c98c` from the main struct (DAT_0005d5e8/DAT_0005dba0):
 
-| Block | Offset range | Channel |
-|---|---|---|
-| Block 1 | 0x60–0x9F | CH1 |
-| Block 2 | 0xA0–0xDF | CH2 |
-
-Key fields within each block (offsets relative to block start):
-
-| Relative offset | Absolute (CH1 / CH2) | Type | Description |
+| Block | File range | Struct range | Channel |
 |---|---|---|---|
-| +0x0A | 0x6A / 0xAA | uint16 BE | V/div index into standard table |
+| Display settings | 0x32–0x61 | +0x00..+0x30 | Shared display state |
+| CH1 config | 0x62–0x81 | +0x38..+0x5A | CH1 |
+| CH1 extended | 0x82–0x9F | +0xC0..+0xDC | CH1 voltage scale, firmware constants |
+| CH2 config | 0xA0–0xC1 | +0xDE..+0x108 | CH2 |
+
+Key fields (firmware struct offset → file offset):
+
+| Struct offset | File offset (CH1/CH2) | Type | Description |
+|---|---|---|---|
+| +0x38 / +0xE8 | 0x62 / 0xA2 | uint8 | V/div stale flag (0=current, 1=stale) |
+| +0x3C / +0xEC | **0x66 / 0xA6** | **uint8** | **Channel enabled** (0=off, non-zero=on) |
+| +0x3F / +0xEF | 0x69 / 0xA9 | uint8 | Timebase index |
+| +0x40 / +0xF0 | 0x6A / 0xAA | uint8 | V/div pad byte (always 0) |
+| +0x42 / +0xF2 | 0x6B / 0xAB | uint16 | V/div index (0–9, LE in struct → BE in file) |
+| +0x48 / +0xF8 | 0x6E / 0xAE | 8 B | Sample rate block |
+| +0x58 / +0x108 | 0x7E / 0xBE | uint16 | Vertical position (GND Y pixel) |
+
+> **Note on V/div read:** The decoder reads u16 BE at 0x6A. The pad byte (+0x40) is always 0, so the u16 BE value equals the V/div index stored at +0x42. This works because the writer byte-swaps from LE to BE.
 
 ### V/div table
 
@@ -238,7 +314,228 @@ Samples per channel = `data_section_size / 8`.
 
 ### Known file sizes
 
-| Size (bytes) | Samples/ch | Notes |
-|---|---|---|
-| 59981 | 6000 | 5 MHz or 10 MHz sample rate |
-| 107993 | 12000 | 200 kHz sample rate |
+| Size (bytes) | Settings header | Data section | Samples/ch | Var table | Notes |
+|---|---|---|---|---|---|
+| 18089 | 12089 | 6000 | 750 | 108 B (9 entries) | ETS captures (e.g. 5 ns/div) |
+| 59981 | 11981 | 48000 | 6000 | 0 B | 10 MHz sample rate (e.g. 100 µs/div) |
+| 107993 | 11993 | 96000 | 12000 | 12 B (1 entry) | 400 MHz sample rate (e.g. 5 µs/div) |
+
+Constraint: `settings_header_size + data_section_size = total_file_size`.
+
+The settings header has **variable length** — see [Variable-length buffer table](#variable-length-buffer-table) below.
+
+### Settings header detailed map
+
+The settings header is ~12 KB with **variable length** (11981–12089 bytes observed). It consists of a 50-byte file header followed by a serialized dump of the oscilloscope's main state structure (`FUN_0005c98c`) and a second structure (trigger/measurements, DAT_0005d780).
+
+The settings block contains ~644 bytes from the main struct, followed by an optional variable-length buffer table, then ~480+ bytes from the second struct. The remaining ~11 KB consists of display graticule data and firmware lookup tables.
+
+#### File header (0x00–0x31)
+
+Written by `FUN_0005da08` after the settings block. 50 bytes total: 7 × uint32 BE at 0x00–0x1B, followed by 22 bytes of padding.
+
+| Offset | Size | Status | Description |
+|---|---|---|---|
+| 0x00 | uint32 BE | KNOWN | Header constant 1 (DAT_0005dbac) |
+| 0x04 | uint32 BE | KNOWN | Header constant 2 (DAT_0005dbb0) |
+| 0x08 | uint32 BE | KNOWN | Header constant 3 (DAT_0005dbb4) |
+| 0x0C | uint32 BE | KNOWN | Header constant 4 (DAT_0005dbb8) |
+| 0x10 | uint32 BE | USED | Data start offset (struct+0x840) |
+| 0x14 | uint32 BE | USED | Data section size (DAT_0005dbbc) |
+| 0x18 | uint32 BE | USED | Total file size (struct+0x850) |
+| 0x1C–0x31 | 22 B | KNOWN | Padding between header and settings |
+
+#### Display settings (0x32–0x61)
+
+Serialized from main struct offsets +0x00 through +0x30.
+
+| Offset | Size | Status | Description | Struct offset |
+|---|---|---|---|---|
+| 0x32 | uint16 BE | KNOWN | Grid columns (=10) | +0x00 |
+| 0x34 | uint16 BE | KNOWN | Grid rows (=20) | +0x02 |
+| 0x36 | uint16 BE | KNOWN | Display height (=300 px) | +0x04 |
+| 0x38 | uint16 BE | KNOWN | Display param (=200) | +0x06 |
+| 0x3A | uint16 BE | KNOWN | CH1 vertical center Y (=150) | +0x08 |
+| 0x3C | uint16 BE | KNOWN | CH2 vertical center Y (=150) | +0x0A |
+| 0x3E | uint16 BE | KNOWN | Display state flag | +0x0C |
+| 0x40 | uint16 BE | KNOWN | CH1 GND line Y (=299) | +0x0E |
+| 0x42 | uint16 BE | KNOWN | CH2 GND line Y (=298) | +0x10 |
+| 0x4A | uint16 BE | KNOWN | Num timebase settings (=25) | +0x18 |
+| 0x56 | uint8 | KNOWN | Display flag 1 | +0x24 |
+| 0x57 | uint8 | KNOWN | Display flag 2 | +0x26 |
+| 0x5A | 8 B | KNOWN | Display state block | +0x30 |
+
+#### CH1 config block (0x62–0x81)
+
+Serialized from struct offsets +0x38 through +0x5A.
+
+| Offset | Size | Status | Description | Struct offset |
+|---|---|---|---|---|
+| 0x62 | uint8 | USED | V/div stale flag | +0x38 |
+| **0x66** | **uint8** | **USED** | **Channel enabled** (0=off, non-zero=on) | +0x3C |
+| 0x69 | uint8 | USED | Timebase index | +0x3F |
+| 0x6A | uint8 | KNOWN | V/div pad (always 0) | +0x40 |
+| 0x6B | uint16 | USED | V/div index (0–9) | +0x42 |
+| 0x6E | 8 B | KNOWN | Sample rate block | +0x48 |
+| 0x76 | 8 B | KNOWN | Sample rate copy | +0x50 |
+| 0x7E | uint16 BE | KNOWN | Vertical position (GND Y pixel) | +0x58 |
+| 0x80 | uint16 BE | KNOWN | Vertical position copy | +0x5A |
+
+#### CH1 extended config (0x82–0x9F)
+
+Serialized from struct offsets +0xC0 through +0xDC.
+
+| Offset | Size | Status | Description | Struct offset |
+|---|---|---|---|---|
+| 0x82 | 8 B | KNOWN | Voltage scale block | +0xC0 |
+| 0x8A | uint32 BE | KNOWN | Display param | +0xC8 |
+| 0x92 | uint32 BE | KNOWN | Firmware constant (0x04000000) | +0xD0 |
+
+#### CH2 config block (0xA0–0xC1)
+
+Mirror of CH1 block, from struct offsets +0xDE through +0x108. The CH2 vertical position copy is stored as a separate global (DAT_0005d5ec) at file offset 0xC0.
+
+| Offset | Size | Status | Description | Struct offset |
+|---|---|---|---|---|
+| 0xA2 | uint8 | USED | V/div stale flag | +0xE8 |
+| **0xA6** | **uint8** | **USED** | **Channel enabled** | +0xEC |
+| 0xA9 | uint8 | USED | Timebase index | +0xEF |
+| 0xAA | uint8 | KNOWN | V/div pad (always 0) | +0xF0 |
+| 0xAB | uint16 | USED | V/div index (0–9) | +0xF2 |
+| 0xBE | uint16 BE | KNOWN | Vertical position | +0x108 |
+
+#### Post-channel config (0xC2–0xE3)
+
+Extended configuration from struct offsets +0x170 through +0x198, mixed with standalone DAT globals.
+
+#### Trigger / cursor / math config (0xE4–0x138)
+
+Firmware-confirmed: trigger parameters (struct+0x23C..+0x248), trigger state flags, cursor position values, math/FFT configuration (struct+0x25C..+0x270), and acquisition state flags. Individual fields from ~40 standalone DAT globals are interleaved with struct fields.
+
+| Offset | Size | Status | Description |
+|---|---|---|---|
+| 0x11B | uint16 BE | KNOWN | ADC center constant (=6400, from DAT_0005d628) |
+| 0x12D | uint32 BE | KNOWN | Buffer sample count per channel (struct+0x28C) |
+| 0x13D | uint32 BE | USED | ADC sample rate in Hz (struct+0x664) |
+
+#### Extended settings area (0x160–end of settings header)
+
+~11.6 KB of firmware state dump. Low entropy (3.77 bits/byte). Contains timer/clock configuration, display parameters, measurement state, and UI state. Key decoded sub-regions:
+
+##### Constant preamble (0x160–0x198)
+
+Identical across all files (both Waveform and Waveform-google). Likely firmware config lookup tables.
+
+##### Timing / horizontal config (0x198–0x220)
+
+| Offset | Size | Status | Description | Struct offset |
+|---|---|---|---|---|
+| 0x19E | uint8 | KNOWN | Horizontal resolution parameter | — (DAT global) |
+| 0x1A8 | uint32 BE | KNOWN | Base clock constant (=2,560,000) | +0x70C |
+| 0x1AC | uint32 BE | KNOWN | Horizontal timer parameter | +0x710 |
+| 0x1B0 | uint32 BE | KNOWN | Base clock 2 (=2,560,000 or =25,600,000) | +0x714 |
+| 0x1B4 | uint32 BE | KNOWN | Constant = 256 | +0x718 |
+| 0x1B8 | uint32 BE | KNOWN | Display X parameter (511 / 2815) | +0x71C |
+| 0x1BC | int32 BE | KNOWN | Y-axis range lower = −38,400 | +0x720 |
+| 0x1C0 | int32 BE | KNOWN | Y-axis range upper = +38,400 | +0x724 |
+| **0x1D4** | **uint8** | **USED** | **Timebase index (s/div)** | DAT_0005d6a4 |
+| **0x1D9** | **uint32 BE** | **USED** | **Time/div in picoseconds** | +0x734 |
+| 0x1DD | uint8 | KNOWN | Constant = 21 (0x15) |
+| 0x1E7 | uint8 | KNOWN | Sample count factor (=N/6000 for Waveform; 1 or 2) |
+| **0x1EF** | **uint32 BE** | **KNOWN** | **Timer value (secondary)** — secondary timing parameter |
+| **0x1F3** | **uint8** | **KNOWN** | **Timebase index (secondary)** — same as 0x1D4 in single-TB; differs in dual-TB mode |
+| **0x1F8** | **uint32 BE** | **KNOWN** | **Timer value (tertiary)** — maps to secondary TB index |
+
+**Dual-timebase**: Files with dual-TB mode (e.g., 3.wav: TB1=1, TB2=5) have 0x1D4 ≠ 0x1F3 and corresponding different timer values at 0x1D9 vs 0x1F8.
+
+**0x1D9 = time/div in picoseconds** (verified):
+
+| Timebase idx (0x1D4) | 0x1D9 (ps) | Time/div | 0x13D (ADC SR) |
+|---|---|---|---|
+| 11 | 5,000 | 5 ns | 705,032,704 (ETS) |
+| 20 | 5,000,000 | 5 µs | 400,000,000 |
+| 21 | 10,000,000 | 10 µs | — |
+| 22 | 20,000,000 | 20 µs | 50,000,000 |
+| 24 | 100,000,000 | 100 µs | 10,000,000 |
+| 25 | 200,000,000 | 200 µs | — |
+
+##### Display range (0x208–0x220)
+
+| Offset | Size | Status | Description |
+|---|---|---|---|
+| 0x208 | uint8 | KNOWN | Mirrors 0x1AE (horizontal resolution) |
+| 0x20A | uint32 BE | KNOWN | Mirrors 0x1A8 (base clock = 2,560,000) |
+| 0x215 | int32 BE | KNOWN | Y-axis range lower in pixels = −150 |
+| 0x219 | uint32 BE | KNOWN | Y-axis range upper in pixels = +150 |
+
+##### Sample count / display block (0x2B0–0x2B7)
+
+Firmware-confirmed: these are the last fixed-offset fields before the variable-length table.
+
+| Offset | Size | Status | Description | Struct source |
+|---|---|---|---|---|
+| 0x2B4 | uint16 BE | KNOWN | Display height = 300 | DAT_0005d778 |
+| 0x2B6 | uint16 BE | KNOWN | Display width = 500 | DAT_0005d77c |
+
+The buffer sample count previously read at 0x2BC is now understood to be part of the second structure (DAT_0005d780), serialized after the variable-length table at base offset 0x2B8+table_size.
+
+##### Variable-length buffer table (0x2B8+)
+
+At offset **0x2B8** (immediately after display_width at 0x2B6) the header contains a **variable-length table** of buffer boundary triplets. The count comes from struct+0x750 written at file offset 0x1E9. All fields after this point are shifted by `table_size` bytes.
+
+`table_size = settings_header_size − 11981`
+
+Each entry is 3 × uint32 BE (12 bytes): `(boundary_1, boundary_2, stride)` where stride = 2 × samples_per_channel.
+
+| Settings header | Table size | Entries | Example values |
+|---|---|---|---|
+| 11981 | 0 B | 0 | (no table) |
+| 11993 | 12 B | 1 | (12000, 18000, 12000) |
+| 12089 | 108 B | 9 | (300, 450, 300), (600, 750, 300), … |
+
+> **Important:** All offsets documented below are **base offsets** (for `settings_size = 11981`). For files with a variable table, add `table_size` to get the actual file offset.
+
+##### Measurement config (base 0x305–0x3A0)
+
+| Base offset | Size | Status | Description |
+|---|---|---|---|
+| 0x305 | uint8 | GUESS | CH1 measurement state (0=off, 1–3=active) |
+| 0x392 | uint8 | GUESS | Measurement type 1 (7=frequency?, 0=off) |
+| 0x394 | uint8 | GUESS | Measurement type 2 (6=period?, 0=off) |
+
+##### Grid / display rendering (base 0x3C0+)
+
+Contains repeating patterns `E3 18` (28× occurrences) and `29 65` — likely display graticule or grid rendering data. Not useful for signal processing.
+
+##### Trigger / cursor / math channel
+
+**Firmware-confirmed** (FUN_0005c98c): The trigger/cursor/math settings are serialized from the main oscilloscope struct at file offsets 0xE4–0x138, interleaved with ~40 standalone DAT globals. Specific fields include trigger mode, trigger edge, trigger level, cursor positions, math/FFT configuration, and acquisition state flags. Individual field identification is in progress — many of the ~40 DAT_* references in the firmware serializer still need mapping to oscilloscope features.
+
+### Display buffer analysis
+
+The display buffer (D/2 bytes, between settings header and ADC data) stores **previously rendered waveform data in screen coordinate space** — not raw ADC values. Key findings:
+
+**Structure**: Two halves of N samples each (uint16 BE):
+- First half ≈ CH1 display data
+- Second half ≈ CH2 display data
+
+**Encoding**: Values are in 0–12800 range (same scale as ADC), but represent **screen-mapped** coordinates:
+```
+display_value = GND_screen_position_in_12800_scale - (adc - 6400) * display_scale
+```
+where `display_scale` depends on V/div and the 300-pixel waveform area height.
+
+**Key properties**:
+- **Heavily quantized**: only 8–70 unique values per file (vs 100–400 for ADC), reflecting screen pixel resolution
+- **Different capture frame**: near-zero per-sample correlation with the saved ADC data (r < 0.05 for most files), because the display shows a previous trigger event, not the currently saved one
+- **Same waveform shape**: when trigger is stable, correlation can reach r=0.76 (file 20.wav), and sorted-value correlation is higher (up to 0.84)
+- **Different value range**: display values include V/div scaling and vertical position offset (e.g., ADC range 3700–9000 maps to display range 10400–10700 when channel is positioned near screen bottom)
+- **Not useful for signal reconstruction**: strictly less precise than the ADC data — the decoder correctly ignores this region
+
+### Header dump utility
+
+`dump_header.py` — dumps all known and suspected DPOX180H header fields with hex/dec/float formatting and color-coded status tags (USED / KNOWN / GUESS / ?).
+
+```bash
+python dump_header.py Waveform/19.wav [Waveform/29.wav ...]
+```
