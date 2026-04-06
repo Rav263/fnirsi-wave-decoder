@@ -100,11 +100,26 @@ The Tektronix CSV format includes a standard 18-row header (`Record Length`, `Sa
 ==================================================
   File:       4.wav
   Timebase:   500ns/div  (index 25)
+  Coupling:   CH1=DC, CH2=DC
   Sample int: 5ns  (1500 samples, total 7.495µs)
   CH1:        Vpp=1313mV, GND offset=202, ADC range=[139-267]
   CH2:        disabled
   CSV:        output/4.csv
   PNG:        output/4.png
+```
+
+With MATH enabled:
+```
+==================================================
+  File:       11.wav
+  Timebase:   2µs/div  (index 23)
+  Coupling:   CH1=DC, CH2=DC
+  MATH:       CH1+CH2  (source: CH1)
+  Sample int: 20ns  (1500 samples, total 29.98µs)
+  CH1:        Vpp=...
+  CH2:        Vpp=...
+  CSV:        output/11.csv   (includes math_r3_raw, math_r4_raw columns)
+  PNG:        output/11.png
 ```
 
 ### DPOX180H example output
@@ -163,21 +178,57 @@ All trace files are exactly **15000 bytes** with the following layout:
 
 | Offset (bytes) | Size | Content |
 |---|---|---|
-| 0–999 | 1000 B | Header (oscilloscope settings, measurements) |
+| 0–999 | 1000 B | Header (oscilloscope settings, measurements) — 500 uint16 LE values |
 | 1000–3999 | 3000 B | CH1 data — 1500 samples, uint16 LE |
 | 4000–6999 | 3000 B | CH2 data — 1500 samples, uint16 LE (zeros if single channel) |
-| 7000–14999 | 8000 B | Extra data |
+| 7000–8499 | 1500 B | Region 3 — 750 processed/MATH samples, uint16 LE |
+| 8500–9999 | 1500 B | Region 4 — 750 processed/MATH samples, uint16 LE |
+| 10000–14999 | 5000 B | Uninitialised (stale buffer contents, ignored) |
 
-### Key header fields (uint16 LE)
+The file is assembled by `FUN_00028a1c` which serializes the oscilloscope state structure and ADC sample buffers into the 15000-byte buffer, then written by `FUN_0005b094`.
 
-| Byte offset | Description |
-|---|---|
-| `0x0C` | CH2 enabled (0 = off, 1 = on) |
-| `0x16` | Timebase index (higher = faster; 25 = 500ns/div) |
-| `0x52` | CH1 GND offset (ADC value for 0V reference) |
-| `0x54` | CH2 GND offset |
-| `0xD2` | CH1 Vpp in mV |
-| `0x102` | CH2 Vpp in mV |
+### Key header fields (uint16 LE, index N = byte offset / 2)
+
+| Byte offset | Index | Firmware source | Description |
+|---|---|---|---|
+| `0x00` | 0 | state[0x3A] | XY display active flag (1 when XY/Lissajous running) |
+| `0x02` | 1 | state[0x00] | CH1 enabled (0 = off) |
+| `0x04` | 2 | state[0x03] | CH1 V/div index (0–5) |
+| `0x06` | 3 | state[0x04] | CH1 FFT enable (0 = off, 1 = on) |
+| `0x08` | 4 | state[0x01] | CH1 coupling (0=DC, 1=AC) |
+| `0x0A` | 5 | state[0x02] | CH1 probe multiplier |
+| `0x0C` | 6 | state[0x0C] | CH2 enabled (0 = off, non-zero = on) |
+| `0x0E` | 7 | state[0x0F] | CH2 V/div index (0–5) |
+| `0x10` | 8 | state[0x10] | CH2 FFT enable (0 = off, 1 = on) |
+| `0x12` | 9 | state[0x0D] | CH2 coupling (0=DC, 1=AC) |
+| `0x14` | 10 | state[0x0E] | CH2 probe multiplier |
+| `0x16` | 11 | state[0x0A] | Timebase index (0–25; higher = faster; 25 = 500ns/div) |
+| `0x18` | 12 | state[0x16] | Trigger mode |
+| `0x1A` | 13 | state[0x21] | **MATH mode** (0=OFF, 1=XY/Lissajous, 2=MATH compute) |
+| `0x1C` | 14 | state[0x22] | **MATH operation** (0–6, see table below) |
+| `0x1E` | 15 | state[0x23] | **MATH source** (0=CH1, 1=CH2) |
+| `0x52` | 41 | *(u16)(state+0x26) | CH1 GND offset (ADC value for 0V reference) |
+| `0x54` | 42 | *(u16)(state+0x06) | CH2 GND offset |
+| `0xD0–0xD2` | 104–105 | meas+0x104 | CH1 Vpp in mV (uint32 as two uint16: hi word, lo word) |
+| `0x100–0x102` | 128–129 | meas+0x1C4 | CH2 Vpp in mV (uint32 as two uint16: hi word, lo word) |
+
+> **Vpp encoding:** Vpp is stored as a uint32 split across two consecutive uint16 LE slots: `vpp_mV = (vals[N] << 16) | vals[N+1]`. This matters at 10V/div where Vpp can exceed 65535 mV.
+
+### MATH operations (vals[14])
+
+| Index | Operation | Firmware function |
+|---|---|---|
+| 0 | FFT(CH1) | `FUN_0002b4ac` case 0 |
+| 1 | CH1 + CH2 | case 1 |
+| 2 | CH1 − CH2 | case 2 |
+| 3 | CH2 − CH1 | case 3 |
+| 4 | CH1 × CH2 | case 4 |
+| 5 | CH1 ÷ CH2 | case 5 |
+| 6 | FFT(CH2) | case 6 |
+
+MATH modes: `vals[13]=0` OFF, `vals[13]=1` XY/Lissajous (CH1→X, CH2→Y), `vals[13]=2` algebraic/FFT computation. When MATH/XY is enabled, the firmware forces timebase ≥ 11 (20ms/div).
+
+Regions 3 and 4 (bytes 7000–9999) contain 750 processed uint16 samples each, populated by the acquisition pipeline and used for MATH display rendering.
 
 ### Timebase index mapping
 

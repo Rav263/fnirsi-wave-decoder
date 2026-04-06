@@ -10,10 +10,39 @@ Supported models:
   - FNIRSI DPOX180H (variable-size files, uint16 BE)
 
 --- FNIRSI 1014D format (15000 bytes total) ---
-  Header:    bytes 0-999    (500 uint16 LE values)
-  CH1 data:  bytes 1000-3999 (1500 uint16 LE samples)
-  CH2 data:  bytes 4000-6999 (1500 uint16 LE samples, zeros if single channel)
-  Extra:     bytes 7000+     (additional data, ignored)
+  File structure (firmware-confirmed, FUN_00028a1c + FUN_0004cc58):
+    [0..999]      Header — 500 uint16 LE values (oscilloscope state + measurements)
+    [1000..3999]  CH1 ADC data — 1500 uint16 LE samples
+    [4000..6999]  CH2 ADC data — 1500 uint16 LE samples (zeros if single channel)
+    [7000..8499]  Region 3 — 750 uint16 LE processed/MATH samples
+    [8500..9999]  Region 4 — 750 uint16 LE processed/MATH samples
+    [10000..14999] Uninitialised (stale buffer contents, ignored)
+
+  Key header fields (all uint16 LE, array index N = byte offset / 2):
+    vals[0]   (0x00)  XY display active flag  — state[0x3A]  (1 when XY running)
+    vals[1]   (0x02)  CH1 enabled             — state[0x00]
+    vals[2]   (0x04)  CH1 V/div index 0-5     — state[0x03]
+    vals[3]   (0x06)  CH1 FFT enable          — state[0x04]
+    vals[4]   (0x08)  CH1 coupling (0=DC,1=AC)— state[0x01]
+    vals[5]   (0x0A)  CH1 probe multiplier    — state[0x02]
+    vals[6]   (0x0C)  CH2 enabled (0=off)     — state[0x0C]
+    vals[7]   (0x0E)  CH2 V/div index 0-5     — state[0x0F]
+    vals[8]   (0x10)  CH2 FFT enable          — state[0x10]
+    vals[9]   (0x12)  CH2 coupling (0=DC,1=AC)— state[0x0D]
+    vals[10]  (0x14)  CH2 probe multiplier    — state[0x0E]
+    vals[11]  (0x16)  timebase index (0-25)   — state[0x0A]
+    vals[12]  (0x18)  trigger mode            — state[0x16]
+    vals[13]  (0x1A)  MATH mode (0=OFF,1=XY,2=MATH) — state[0x21]
+    vals[14]  (0x1C)  MATH operation 0-6      — state[0x22]
+    vals[15]  (0x1E)  MATH source (0=CH1,1=CH2)     — state[0x23]
+    vals[41]  (0x52)  CH1 GND ADC offset      — *(u16)(state+0x26)
+    vals[42]  (0x54)  CH2 GND ADC offset      — *(u16)(state+0x06)
+    vals[104] (0xD0)  CH1 Vpp high word       — meas+0x104 >> 16
+    vals[105] (0xD2)  CH1 Vpp low word        — meas+0x104 & 0xFFFF
+    vals[128] (0x100) CH2 Vpp high word       — meas+0x1C4 >> 16
+    vals[129] (0x102) CH2 Vpp low word        — meas+0x1C4 & 0xFFFF
+    Vpp is uint32 stored as two consecutive uint16 LE: full_vpp = (hi << 16) | lo
+    MATH ops: 0=FFT(CH1), 1=CH1+CH2, 2=CH1−CH2, 3=CH2−CH1, 4=CH1×CH2, 5=CH1÷CH2, 6=FFT(CH2)
 
 --- FNIRSI DPOX180H format (variable size) ---
   File structure (firmware-confirmed, FUN_0005da08 + FUN_0005c98c):
@@ -69,8 +98,27 @@ SAMPLES_PER_DIV = 100   # 100 samples per horizontal division
 N_HDIV = 15             # number of horizontal divisions
 
 # Data offsets (uint16 index)
-CH1_START = 500   # byte 1000
-CH2_START = 2000  # byte 4000
+CH1_START = 500    # byte 1000
+CH2_START = 2000   # byte 4000
+REGION3_START = 3500  # byte 7000 — processed/MATH buffer 1
+REGION4_START = 4250  # byte 8500 — processed/MATH buffer 2
+REGION_SAMPLES = 750  # 750 uint16 samples per region (half of CH1/CH2)
+
+# MATH mode values (vals[13] = state[0x21])
+MATH_OFF = 0
+MATH_XY  = 1   # XY / Lissajous display
+MATH_ON  = 2   # Algebraic math computation
+
+# MATH operation names (vals[14] = state[0x22], index 0-6)
+MATH_OP_NAMES = {
+    0: 'FFT(CH1)',
+    1: 'CH1+CH2',
+    2: 'CH1\u2212CH2',
+    3: 'CH2\u2212CH1',
+    4: 'CH1\u00d7CH2',
+    5: 'CH1\u00f7CH2',
+    6: 'FFT(CH2)',
+}
 
 # Timebase lookup: index → nanoseconds per division
 # 1-2-5 sequence, higher index = faster timebase
@@ -147,13 +195,26 @@ def parse_trace(filepath):
 
     vals = struct.unpack('<' + 'H' * (FILE_SIZE // 2), data)
 
-    # --- Parse header ---
-    ch2_enabled = vals[6] != 0
-    timebase_idx = vals[11]
-    ch1_gnd = vals[41]
-    ch2_gnd = vals[42]
-    ch1_vpp_mV = vals[105]
-    ch2_vpp_mV = vals[129] if ch2_enabled else 0
+    # --- Parse header (firmware: FUN_00028a1c serialises state struct) ---
+    ch1_enabled  = vals[1] != 0           # state[0x00]
+    ch2_enabled  = vals[6] != 0           # state[0x0C]
+    ch1_vdiv_idx = vals[2]                # state[0x03] CH1 V/div index 0-5
+    ch2_vdiv_idx = vals[7]                # state[0x0F] CH2 V/div index 0-5
+    ch1_coupling = vals[4]                # state[0x01] 0=DC, 1=AC
+    ch2_coupling = vals[9]                # state[0x0D] 0=DC, 1=AC  (NOT vals[5]!)
+    ch1_probe    = vals[5]                # state[0x02] probe multiplier
+    ch2_probe    = vals[10]               # state[0x0E] probe multiplier
+    fft_ch1      = vals[3] != 0           # state[0x04] CH1 FFT enable
+    fft_ch2      = vals[8] != 0           # state[0x10] CH2 FFT enable
+    timebase_idx = vals[11]               # state[0x0A]
+    math_mode    = vals[13]               # state[0x21] 0=OFF, 1=XY, 2=MATH
+    math_op      = vals[14]               # state[0x22] operation index 0-6
+    math_source  = vals[15]               # state[0x23] 0=CH1, 1=CH2
+    ch1_gnd      = vals[41]               # *(u16)(state+0x26)
+    ch2_gnd      = vals[42]               # *(u16)(state+0x06)
+    # Vpp is uint32 stored as two consecutive uint16 LE words (hi, lo)
+    ch1_vpp_mV = (vals[104] << 16) | vals[105]
+    ch2_vpp_mV = ((vals[128] << 16) | vals[129]) if ch2_enabled else 0
 
     # --- Extract raw samples (always decode both channels) ---
     ch1_raw = list(vals[CH1_START:CH1_START + SAMPLES_PER_CHANNEL])
@@ -184,6 +245,10 @@ def parse_trace(filepath):
     ch1_mV = adc_to_mV(ch1_raw, ch1_gnd, ch1_vpp_mV)
     ch2_mV = adc_to_mV(ch2_raw, ch2_gnd, ch2_vpp_mV if ch2_enabled else ch1_vpp_mV)
 
+    # --- MATH / processed data regions (750 samples each) ---
+    math_r3_raw = list(vals[REGION3_START:REGION3_START + REGION_SAMPLES])
+    math_r4_raw = list(vals[REGION4_START:REGION4_START + REGION_SAMPLES])
+
     return {
         'ch1_raw': ch1_raw,
         'ch2_raw': ch2_raw,
@@ -198,6 +263,20 @@ def parse_trace(filepath):
         'ch1_gnd': ch1_gnd,
         'ch2_gnd': ch2_gnd,
         'sample_interval_ns': sample_interval_ns,
+        'ch1_enabled': ch1_enabled,
+        'ch1_coupling': ch1_coupling,
+        'ch2_coupling': ch2_coupling,
+        'ch1_probe': ch1_probe,
+        'ch2_probe': ch2_probe,
+        'ch1_vdiv_idx': ch1_vdiv_idx,
+        'ch2_vdiv_idx': ch2_vdiv_idx,
+        'fft_ch1': fft_ch1,
+        'fft_ch2': fft_ch2,
+        'math_mode': math_mode,
+        'math_op': math_op,
+        'math_source': math_source,
+        'math_r3_raw': math_r3_raw,
+        'math_r4_raw': math_r4_raw,
         'model': '1014D',
     }
 
@@ -481,6 +560,81 @@ def parse_trace_dpox180h(filepath, ch1_vdiv_mV=None, ch2_vdiv_mV=None):
     }
 
 
+def extract_screen_image(filepath):
+    """
+    Extract the screen thumbnail from a DPOX180H .wav file.
+
+    The screen buffer section contains a small RGB565 screenshot of the
+    oscilloscope display (typically 102×54 pixels).
+
+    Layout at screen_buffer_start:
+      +0x00  u16 BE  width
+      +0x02  u16 BE  height
+      +0x04  width × height × u16 BE  RGB565 pixel data
+
+    Returns a PIL.Image in RGB mode, or raises ValueError on format errors.
+    """
+    with open(filepath, 'rb') as f:
+        data = f.read()
+
+    if len(data) < 256:
+        raise ValueError(
+            f"File too small for DPOX180H format: {len(data)} bytes"
+        )
+
+    # Section table
+    scr_buf_start = struct.unpack('>I', data[0x08:0x0C])[0]
+    scr_buf_size  = struct.unpack('>I', data[0x0C:0x10])[0]
+
+    if scr_buf_start + scr_buf_size > len(data):
+        raise ValueError(
+            f"Screen buffer extends beyond file: offset {scr_buf_start} + "
+            f"size {scr_buf_size} > file length {len(data)}"
+        )
+
+    # Read dimensions
+    width  = struct.unpack('>H', data[scr_buf_start:scr_buf_start + 2])[0]
+    height = struct.unpack('>H', data[scr_buf_start + 2:scr_buf_start + 4])[0]
+
+    expected_size = 4 + width * height * 2
+    if expected_size != scr_buf_size:
+        raise ValueError(
+            f"Screen buffer size mismatch: header says {width}×{height} "
+            f"({expected_size} bytes) but section is {scr_buf_size} bytes"
+        )
+
+    # Decode RGB565 big-endian pixels
+    pixel_data = data[scr_buf_start + 4:scr_buf_start + 4 + width * height * 2]
+    pixels = struct.unpack('>' + 'H' * (width * height), pixel_data)
+
+    img = Image.new('RGB', (width, height))
+    rgb = []
+    for p in pixels:
+        r = ((p >> 11) & 0x1F) << 3
+        g = ((p >> 5) & 0x3F) << 2
+        b = (p & 0x1F) << 3
+        rgb.append((r, g, b))
+    img.putdata(rgb)
+    return img
+
+
+def save_screen_image(img, output_path, scale=4):
+    """
+    Save a screen thumbnail as an upscaled PNG.
+
+    Args:
+        img: PIL.Image from extract_screen_image()
+        output_path: destination file path
+        scale: integer upscale factor (default 4, e.g. 102×54 → 408×216)
+    """
+    if scale > 1:
+        img = img.resize(
+            (img.width * scale, img.height * scale),
+            Image.NEAREST,
+        )
+    img.save(output_path)
+
+
 def _format_vdiv(mV):
     """Format V/div value in mV to human-readable string."""
     if mV >= 1000:
@@ -492,20 +646,31 @@ def _format_vdiv(mV):
 def save_csv(trace, output_path):
     """Export trace data to CSV."""
     n_samples = len(trace['ch1_raw'])
+    math_active = trace.get('math_mode', MATH_OFF) != MATH_OFF
+    math_r3 = trace.get('math_r3_raw', [])
+    math_r4 = trace.get('math_r4_raw', [])
     with open(output_path, 'w', newline='') as f:
         writer = csv.writer(f)
 
-        writer.writerow([
-            'time_ns', 'ch1_mV', 'ch2_mV', 'ch1_raw', 'ch2_raw'
-        ])
+        header = ['time_ns', 'ch1_mV', 'ch2_mV', 'ch1_raw', 'ch2_raw']
+        if math_active:
+            header.extend(['math_r3_raw', 'math_r4_raw'])
+        writer.writerow(header)
         for i in range(n_samples):
-            writer.writerow([
+            row = [
                 f"{trace['time_ns'][i]:.2f}",
                 f"{trace['ch1_mV'][i]:.2f}",
                 f"{trace['ch2_mV'][i]:.2f}",
                 trace['ch1_raw'][i],
                 trace['ch2_raw'][i],
-            ])
+            ]
+            if math_active:
+                # Regions 3/4 have 750 samples (half resolution);
+                # map to nearest index
+                mi = i * len(math_r3) // n_samples if math_r3 else 0
+                row.append(math_r3[mi] if mi < len(math_r3) else '')
+                row.append(math_r4[mi] if mi < len(math_r4) else '')
+            writer.writerow(row)
 
 
 def choose_time_units(max_ns):
@@ -557,6 +722,20 @@ def save_png(trace, output_path, title=''):
         ch2_label = f"CH2 (Vpp={trace['ch2_vpp_mV']}mV){ch2_disabled_tag}"
     ax.plot(time_plot, trace['ch2_mV'],
             label=ch2_label, color='#00FFFF', linewidth=0.8)
+
+    # MATH trace (1014D only, when MATH active)
+    math_mode = trace.get('math_mode', MATH_OFF)
+    if math_mode != MATH_OFF and not is_dpox:
+        math_r3 = trace.get('math_r3_raw', [])
+        if math_r3 and any(v != 0 for v in math_r3):
+            n_math = len(math_r3)
+            math_time = [i * (time_plot[-1] / (n_math - 1)) for i in range(n_math)] if n_math > 1 else [0]
+            op_name = MATH_OP_NAMES.get(trace.get('math_op', -1), 'MATH')
+            if math_mode == MATH_XY:
+                op_name = 'XY'
+            ax.plot(math_time, math_r3,
+                    label=f'MATH ({op_name})', color='#FF6BFF',
+                    linewidth=0.7, alpha=0.85)
 
     # Styling (dark oscilloscope theme)
     ax.set_xlabel(f'Time ({unit})', color='white')
@@ -616,6 +795,21 @@ def save_plot(trace, output_path, title='', fmt='png'):
         ch2_label = f"CH2 (Vpp={trace['ch2_vpp_mV']}mV){ch2_disabled_tag}"
     ax.plot(time_plot, trace['ch2_mV'],
             label=ch2_label, color='#00FFFF', linewidth=0.8)
+
+    # MATH trace (1014D only, when MATH active)
+    math_mode = trace.get('math_mode', MATH_OFF)
+    if math_mode != MATH_OFF and not is_dpox:
+        math_r3 = trace.get('math_r3_raw', [])
+        if math_r3 and any(v != 0 for v in math_r3):
+            # Region 3 has 750 samples — build its own time axis
+            n_math = len(math_r3)
+            math_time = [i * (time_plot[-1] / (n_math - 1)) for i in range(n_math)] if n_math > 1 else [0]
+            op_name = MATH_OP_NAMES.get(trace.get('math_op', -1), 'MATH')
+            if math_mode == MATH_XY:
+                op_name = 'XY'
+            ax.plot(math_time, math_r3,
+                    label=f'MATH ({op_name})', color='#FF6BFF',
+                    linewidth=0.7, alpha=0.85)
 
     ax.set_xlabel(f'Time ({unit})', color='white')
     ax.set_ylabel(y_label, color='white')
@@ -783,6 +977,25 @@ def print_info(filepath, trace):
             print(f"  V/div:      not detected (use --vdiv to calibrate)")
     else:
         print(f"  Timebase:   {tb}  (index {trace['timebase_idx']})")
+        coupling_map = {0: 'DC', 1: 'AC'}
+        ch1_cpl = coupling_map.get(trace.get('ch1_coupling', -1), '?')
+        ch2_cpl = coupling_map.get(trace.get('ch2_coupling', -1), '?')
+        print(f"  Coupling:   CH1={ch1_cpl}, CH2={ch2_cpl}")
+        # MATH / FFT status
+        math_mode = trace.get('math_mode', MATH_OFF)
+        if math_mode == MATH_XY:
+            print(f"  MATH:       XY (Lissajous)")
+        elif math_mode == MATH_ON:
+            op_name = MATH_OP_NAMES.get(trace.get('math_op', -1), '?')
+            src = 'CH1' if trace.get('math_source', 0) == 0 else 'CH2'
+            print(f"  MATH:       {op_name}  (source: {src})")
+        fft_parts = []
+        if trace.get('fft_ch1'):
+            fft_parts.append('CH1')
+        if trace.get('fft_ch2'):
+            fft_parts.append('CH2')
+        if fft_parts:
+            print(f"  FFT:        {', '.join(fft_parts)}")
     print(f"  Sample int: {si}  ({n_samples} samples, total {total})")
     print(f"  CH1:        Vpp={trace['ch1_vpp_mV']}mV, "
           f"GND offset={trace['ch1_gnd']}, "
@@ -823,6 +1036,15 @@ def main():
              '(e.g. --vdiv 10000,500 for CH1=10V CH2=500mV). '
              'One value applies to both channels. '
              'Overrides auto-detection from the file header.'
+    )
+    parser.add_argument(
+        '--screenshot', action='store_true',
+        help='Extract screen thumbnail from DPOX180H file and save as PNG '
+             '(only for --model dpox180h)'
+    )
+    parser.add_argument(
+        '--screenshot-scale', type=int, default=4, metavar='N',
+        help='Upscale factor for extracted screenshot (default: 4)'
     )
     args = parser.parse_args()
 
@@ -868,6 +1090,18 @@ def main():
         print_info(filepath, trace)
         print(f"  CSV:        {csv_path}")
         print(f"  PNG:        {png_path}")
+
+        if args.screenshot and args.model == 'dpox180h':
+            try:
+                scr_img = extract_screen_image(filepath)
+                scr_path = os.path.join(out_dir, f'{basename}_screen.png')
+                save_screen_image(scr_img, scr_path, scale=args.screenshot_scale)
+                print(f"  Screenshot: {scr_path} "
+                      f"({scr_img.width}×{scr_img.height} → "
+                      f"{scr_img.width * args.screenshot_scale}×"
+                      f"{scr_img.height * args.screenshot_scale})")
+            except ValueError as e:
+                print(f"  Screenshot: FAILED — {e}", file=sys.stderr)
 
         if args.tek:
             tek_name = basename.zfill(4)
